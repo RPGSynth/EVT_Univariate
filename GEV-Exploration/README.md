@@ -1,58 +1,80 @@
-# ================================
-#           WORK PLAN
-# ================================
+# =====================================
+#               🌟 WORK PLAN 🌟
+# =====================================
 
-# 1. Data Preparation
--------------------
+## 1. Data Preparation
+----------------------
 
-### Python
-1.1 **Load NETCDF files** (factual and counterfactual datasets) into R  
-   - **Input**: NETCDF files for precipitation sum (74 years) and simulated stationary data.
-   
-1.2 **Convert NETCDF files to DataFrame**  
-   - **Output**: DataFrames for each dataset.
+### 🐍 **Python**
 
-1.3 **Preprocess data**: Remove 6 winter months to focus on the summer period  
-   - **Output**: Cleaned DataFrames (only summer months).
+#### 1.1. **Load NETCDF Files**
+- **Objective**: Load both factual and counterfactual datasets (precipitation sums over 74 years and simulated stationary data).
+- **Input**: NETCDF files.
 
-1.4 **Block data into yearly (or other meaningful) block sizes**, e.g., monthly maxima  
-   - **Output**: Blocked datasets for factual and counterfactual worlds.
+#### 1.2. **Convert NETCDF to DataFrame**
+- **Objective**: Convert the loaded datasets into DataFrames.
+- **Output**: DataFrames for both factual and counterfactual datasets.
 
-# 2. Modeling
------------
+#### 1.3. **Data Preprocessing**
+- **Objective**: Focus on the summer period by removing the 6 winter months (October to March).
+- **Output**: Cleaned DataFrames containing only data from April to September.
 
-### R
-2.1 **Fit different GEV models** to both datasets:  
-   - **Model A**: Linear trend in location, constant scale and shape.  
-   - **Model B**: Linear trend in location and scale, constant shape.  
-   - **Model C**: Linear trends in location, scale, and shape.  
-   - **Model D**: Tradowsky-style model (constant mu/sigma assumption).  
-   - **Model E**: GAM-based model for non-stationary parameters.  
-   - **Output**: Fitted GEV models for both datasets.
+#### 1.4. **Block Data into Meaningful Periods**
+- **Objective**: Block the data into yearly or other relevant periods (e.g., monthly maxima or 10-day blocks).
+- **Output**: Blocked datasets for both factual and counterfactual worlds.
 
-# 3. Model Diagnostics & Validation
----------------------------------
+---
 
-### R
-3.1 **Verify Tradowsky assumptions** (constant mu/sigma):  
-   - Create plots to check stationarity and ratios for the assumption.
+## 2. Modeling
+--------------
 
-3.2 **Compare model fits** across factual and counterfactual datasets:  
-   - Check confidence intervals on shape parameter (xi) for each model.  
-   - **Output**: Comparison plots for model parameters (factual vs. counterfactual).
+### 📊 **R**
 
-3.3 **Assess correlations between parameter estimates**:  
-   - Explore correlations between location (mu), scale (sigma), and shape (xi).  
-   - **Output**: Correlation plots between parameter estimates.
+#### 2.1. **Fit GEV Models to Both Datasets**
+- **Objective**: Fit different Generalized Extreme Value (GEV) models to the data.
+  
+  - **Model A**: Linear trend in location, constant scale, and shape.
+  - **Model B**: Linear trend in location and scale, constant shape.
+  - **Model C**: Linear trends in location, scale, and shape.
+  - **Model D**: Tradowsky-style model (constant \(\mu\) and \(\sigma\)).
+  - **Model E**: GAM-based model for non-stationary parameters.
 
-# 4. Post-Processing & Interpretation
------------------------------------
+- **Output**: Fitted GEV models for both factual and counterfactual datasets.
 
-### R
-4.1 **Extract return levels and confidence intervals** for all models  
-   - **Output**: Return level estimates for both datasets.
+---
 
-4.2 **Compare return levels** between factual and counterfactual worlds.
+## 3. Model Diagnostics & Validation
+------------------------------------
 
-4.3 **Summarize findings** on differences in precipitation extremes  
-   - **Output**: Comparative analysis report.
+### 📈 **R**
+
+#### 3.1. **Verify Tradowsky Assumptions**
+- **Objective**: Create diagnostic plots to verify the constant \(\mu\) and \(\sigma\) assumptions from the Tradowsky model.
+- **Output**: Stationarity check plots.
+
+#### 3.2. **Compare Model Fits**
+- **Objective**: Compare the fits of the GEV models across factual and counterfactual datasets.
+- **Focus**: Confidence intervals on the shape parameter (\(\xi\)) for each model.
+- **Output**: Comparison plots of model parameters (factual vs. counterfactual).
+
+#### 3.3. **Assess Correlations Between Parameters**
+- **Objective**: Investigate correlations between location (\(\mu\)), scale (\(\sigma\)), and shape (\(\xi\)) parameters.
+- **Output**: Correlation plots between the parameter estimates.
+
+---
+
+## 4. Post-Processing & Interpretation
+--------------------------------------
+
+### 🔍 **R**
+
+#### 4.1. **Extract Return Levels and Confidence Intervals**
+- **Objective**: Extract return levels and confidence intervals for all fitted models.
+- **Output**: Return level estimates for both datasets.
+
+#### 4.2. **Compare Return Levels**
+- **Objective**: Compare return levels between the factual and counterfactual worlds.
+
+#### 4.3. **Summarize Findings**
+- **Objective**: Summarize the findings on differences in precipitation extremes between the factual and counterfactual worlds.
+- **Output**: Comprehensive comparative analysis report.
