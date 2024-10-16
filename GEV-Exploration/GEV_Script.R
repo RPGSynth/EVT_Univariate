@@ -6,6 +6,7 @@ library(terra)
 library(ggplot2)
 library(dplyr)
 library(tidyr)
+library(lubridate) 
 
 # ================================
 #           WORK PLAN
@@ -13,6 +14,7 @@ library(tidyr)
 
 # 1. Data Preparation
 # -------------------
+## Python ##
 # 1.1 Load NETCDF files (factual and counterfactual datasets) into R
 #     - Input: NETCDF files for precipitation sum (74 years) and simulated stationary data.
 # 1.2 Convert NETCDF files to DataFrame.
@@ -24,6 +26,7 @@ library(tidyr)
 
 # 2. Modeling
 # -----------
+##R## 
 # 2.1 Fit different GEV models to both datasets:
 #     - Model A: Linear trend in location, constant scale and shape.
 #     - Model B: Linear trend in location and scale, constant shape.
@@ -34,6 +37,7 @@ library(tidyr)
 
 # 3. Model Diagnostics & Validation
 # ---------------------------------
+##R##
 # 3.1 Verify Tradowsky assumptions (constant mu/sigma):
 #     - Create plots to check stationarity and ratios for the assumption.
 # 3.2 Compare model fits across factual and counterfactual datasets:
@@ -45,6 +49,7 @@ library(tidyr)
 
 # 4. Post-Processing & Interpretation
 # -----------------------------------
+##R##
 # 4.1 Extract return levels and confidence intervals for all models.
 #     - Output: Return level estimates for both datasets.
 # 4.2 Compare return levels between factual and counterfactual worlds.
@@ -70,7 +75,7 @@ load_nc_to_rast <- function(nc_file_path) {
 # Function: 2] process_rast
 # Purpose: Crop a SpatRaster object to a specific extent, convert to DataFrame, and reshape data
 # ================================
-process_nc_raster <- function(nc_data, xmin, xmax, ymin, ymax, time_steps_filter) {
+process_nc_raster <- function(nc_data, xmin, xmax, ymin, ymax) {
   # 2.1 Define the extent for cropping
   extent_art <- ext(xmin, xmax, ymin, ymax)
   
@@ -79,21 +84,22 @@ process_nc_raster <- function(nc_data, xmin, xmax, ymin, ymax, time_steps_filter
   message("Raster cropped to the specified extent.")
   
   # 2.3 Convert the raster to a data frame
-  flood_df <- as.data.frame(nc_subset, cells = TRUE, na.rm = TRUE)
-  
-  # Remove the spatial coordinate columns ('cell', 'x', 'y') to focus on time series values
-  time_series_df <- flood_df[, -c(1:3)]
+  flood_df <- as.data.frame(nc_subset, cells = FALSE, na.rm = NA)
   
   # Rename columns to represent time steps
-  colnames(time_series_df) <- 1:ncol(time_series_df)
+  colnames(flood_df) <- 1:ncol(flood_df)
   
   # 2.4 Reshape the data to long format and filter for the last x time steps
-  time_series_long_filtered <- time_series_df %>%
+  time_series_long_filtered <- flood_df %>%
     pivot_longer(cols = everything(), names_to = "day", values_to = "value") %>%
-    mutate(day = as.numeric(day)) %>%
-    filter(day > (max(day) - time_steps_filter))
+    mutate(
+      day = as.numeric(day),
+      date = as.Date(day - 1, origin = "1950-01-01"),  # Convert to date format
+      month = month(date)  # Extract the month
+    ) %>%
+    filter(month >= 4 & month <= 9)
   
-  # Return the reshaped data frame
+  # Return the reshaped and filtered data frame
   return(time_series_long_filtered)
 }
 
@@ -104,9 +110,9 @@ process_nc_raster <- function(nc_data, xmin, xmax, ymin, ymax, time_steps_filter
 nc_file <- "C:/Users/bobel/OneDrive - Université de Namur/Data/E_OBS/rr_ens_mean_0.25deg_reg_v30.0e.nc"
 nc_data = load_nc_to_rast(nc_file)
 
-# Print basic information about the NetCDF file
-print(nc_data)
-
+has_na <- global(nc_data, fun = function(x) any(is.na(x)))
+# Output result
+print(has_na)
 # -----------------------------------------------------------
 # VISUALIZE THE LAST TIME LAYER (FINAL DAY) 
 # -----------------------------------------------------------
@@ -124,17 +130,14 @@ xmax <- 6.0   # Maximum longitude
 ymin <- 48    # Minimum latitude
 ymax <- 52    # Maximum latitude
 
-# Filter to the last 100 time steps
-time_steps_filter <- 100
-
 # Process the data (crop, convert, and reshape)
-time_series_long_filtered <- process_nc_raster(nc_data, xmin, xmax, ymin, ymax, time_steps_filter)
+time_series_long_filtered <- process_nc_raster(nc_data, xmin, xmax, ymin, ymax)
 
 
 # -----------------------------------------------------------
 # PLOT TIME SERIES FOR THE LAST X TIME STEPS
 # -----------------------------------------------------------
-ggplot(time_series_long_filtered, aes(x = day, y = value)) +
+time_series_long_filtered %>% filter(day > (max(day) - 1000)) %>% ggplot(aes(x = day, y = value)) +
   geom_point(alpha = 0.6, color = "blue", size = 0.2) +
   labs(title = "Time Series Values for the Last 100 Time Steps",
        x = "time",
