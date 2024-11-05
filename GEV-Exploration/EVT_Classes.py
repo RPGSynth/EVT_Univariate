@@ -1,22 +1,12 @@
 import os
 import pandas as pd
 import xarray as xr
-import cftime
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-import matplotlib.colors as colors
-from matplotlib.gridspec import GridSpec
-import cartopy.crs as ccrs
-import cartopy.feature as ftr
-from IPython.display import HTML
 import numpy as np
 from scipy.optimize import minimize
 from statsmodels.base.model import GenericLikelihoodModel
 import numpy as np
 import pandas as pd
-import warnings
-from scipy import stats
-import math
 import numdifftools as nd
 import statsmodels.api as sm
 from scipy.optimize import approx_fprime
