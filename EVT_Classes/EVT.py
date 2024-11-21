@@ -16,7 +16,7 @@ from scipy.stats import gumbel_r
 
 class EVTModel:
     """
-    A statistical model for EVT (Extreme Value Theory), supporting GEV and GPD models.
+    A statistical model supporting GEV models.
     
     Attributes
     ----------
