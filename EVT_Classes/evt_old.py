@@ -257,6 +257,7 @@ class GEV(EVTLikelihood):
             -np.log((1 + (fitted_shape * (self.endog - fitted_loc)) / fitted_scale) ** (-1 / fitted_shape))
             if self.trans else self.endog
         )
+        print(result.like.data.shape)
 
         return result
 
@@ -412,10 +413,11 @@ class GEVResult(EVTResults):
         if self.like.trans:
             # Sort the data for plotting
             sorted_data = np.sort(self.like.data)
+            print(sorted_data.reshape(-1,1))
             n = self.like.len_endog
             x = np.arange(1, n + 1) / (n + 1)
 
-            # Empirical vs Model Plot
+            # Empirical vs Model Plot 
             ax.scatter(x, np.exp(-np.exp(-sorted_data)), color="#4a90e2", label="Empirical vs Model")
             ax.plot([0, 1], [0, 1], color="red", linestyle="--", linewidth=1.5, label="45° Line")  # Reference line
             ax.set_xlabel("Empirical", fontsize=12)
@@ -636,3 +638,13 @@ class GEVResult(EVTResults):
             plt.legend()
             plt.grid(True, linestyle=':', color='grey', alpha=0.6)
             plt.show()
+
+
+EOBS = pd.read_csv(r"c:\ThesisData\OUTPUTS\UCL_blockmax.csv")
+
+n = len(EOBS["prmax"].values.reshape(-1,1))
+exog = {"location" : EOBS["tempanomalyMean"]}
+model = GEV(endog=EOBS["prmax"],exog=exog)
+gev_result_1 = model.fit()
+print(gev_result_1)
+gev_result_1.probability_plot()
