@@ -209,13 +209,13 @@ class GEVLikelihood(GEV):
         """
         # Extract the number of covariates for each parameter
         x1 = self.exog['location'].shape[1] 
-        x2 = self.exog['shape'].shape[1] 
-        x3 = self.exog['scale'].shape[1] 
+        x2 = self.exog['scale'].shape[1] 
+        x3 = self.exog['shape'].shape[1] 
 
         # Compute location, scale, and shape parameters
         location = self.loc_link(np.dot(self.exog['location'], params[:x1].reshape(-1,1)))
-        scale = self.scale_link(np.dot(self.exog['scale'], params[x1:x1 + x2].reshape(-1,1)))
-        shape = self.shape_link(np.dot(self.exog['shape'], params[x1 + x2:].reshape(-1,1)))
+        scale = self.scale_link(np.dot(self.exog['scale'], params[x1:(x1 + x2)].reshape(-1,1)))
+        shape = self.shape_link(np.dot(self.exog['shape'], params[(x1 + x2):].reshape(-1,1)))
         # GEV transformation
         normalized_data = (self.endog - location) / scale
         transformed_data = 1 + shape * normalized_data
@@ -304,7 +304,7 @@ class GEVResult():
         return 2 * self.nparams + 2 * self.log_likelihood
 
     def BIC(self):
-        return self.nparams * np.log(self.len_endog) + 2 * self.log_likelihood
+        return self.nparams * 1 + 2 * self.log_likelihood
 
     def SE(self):
         # Compute standard errors using the inverse Hessian matrix
@@ -418,11 +418,11 @@ class GEVResult():
             ax.legend()
 
 if __name__ == "__main__":
-    EOBS = pd.read_csv(r"c:\ThesisData\OUTPUTS\UCL_blockmax.csv")
+    EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
     n = len(EOBS["prmax"].values.reshape(-1,1))
-    exog = {"location" : EOBS["tempanomalyMean"].values.reshape(-1,1)}
-    model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1))
+    exog = {'scale':EOBS["tempanomalyMean"].values.reshape(-1,1)}
+    model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     gev_result_1 = model.fit()
     gev_result_1.probability_plot()
     plt.show()
