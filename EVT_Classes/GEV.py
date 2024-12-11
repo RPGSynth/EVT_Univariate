@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
+from matplotlib import rcParams
 import numpy as np
 from scipy.optimize import minimize
 from statsmodels.base.model import GenericLikelihoodModel
@@ -13,6 +14,7 @@ from scipy.optimize import approx_fprime
 from scipy.stats import norm
 from scipy.stats import chi2
 from scipy.stats import gumbel_r
+from scipy.stats import genextreme
 
 class GEV:
     """
@@ -158,7 +160,7 @@ class GEV:
         This is a placeholder intended to be overwritten by individual models.
         """
         raise NotImplementedError
-    
+
 class GEVLikelihood(GEV):
     def __init__(self, endog, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, exog={'shape': None, 'scale': None, 'location': None}, **kwargs):
         """
@@ -290,6 +292,7 @@ class GEVResult():
     def __init__(self, optimize_result, endog, len_endog, trans,plot_data,gev_params):
             # Extract relevant attributes from optimize_result and give them meaningful names
             self.fitted_params = optimize_result.x
+            self.endog = endog
             self.log_likelihood = optimize_result.fun
             self.hessian_inverse = optimize_result.hess_inv
             self.jacobian = optimize_result.jac
@@ -384,45 +387,115 @@ class GEVResult():
                 
         return cdf_values
     
-    def probability_plot(self,ax=None):
-        sorted_data  = np.sort(self.plot_data, axis=0)
-        if ax is None:
-            ax = plt.gca()
-
-        if self.trans:
-            # Sort the data for plotting
-            n = self.len_endog
-            x = np.arange(1, n + 1) / (n + 1)
-
-            # Empirical vs Model Plot
-            ax.scatter(x, np.exp(-np.exp(-sorted_data)), color="#4a90e2", label="Empirical vs Model")
-            ax.plot([0, 1], [0, 1], color="red", linestyle="--", linewidth=1.5, label="45° Line")  # Reference line
-            ax.set_xlabel("Empirical", fontsize=12)
-            ax.set_ylabel("Model", fontsize=12)
-            ax.set_title("Residual Probability Plot", fontsize=14)
-            ax.grid(True, linestyle=':', color='grey', alpha=0.6)
-            ax.legend()
+    def gevq(self,p,a):
+        location, scale, shape = a[0], a[1], a[2]
+        if shape != 0:
+            return location + (scale * ((-np.log(1 - p))**(-shape) - 1)) / shape
         else:
-            n = self.len_endog
-            # Empirical probabilities
-            empirical_probs = np.arange(1, len(self.plot_data) + 1) / len(self.plot_data)
-            # Calculate the model probabilities using the GEV distribution function
-            model_probs = self.gevf(self.fitted_params, sorted_data)
-            
-            # Plot the probability plot
-            ax.plot(empirical_probs, model_probs, 'o', label="Model vs. Empirical")
-            ax.plot([0, 1], [0, 1], 'r--', label="y = x")  # Reference line for a perfect fit
-            ax.set_xlabel("Empirical")
-            ax.set_ylabel("Model")
-            ax.set_title("Probability Plot")
-            ax.legend()
+            # Use Gumbel quantile from scipy.stats.gumbel_r
+            return gumbel_r.ppf(p, loc=location, scale=scale)
+        
+    def compute_gev_quantiles(self,p):
+        """
+        Computes the quantiles for multiple GEV distributions for a given probability p,
+        using the scipy.stats.genextreme library.
+
+        Parameters:
+        p (float): The probability for which to compute the quantiles (0 < p < 1).
+        gev_params (tuple): Tuple of arrays (fitted_loc, fitted_scale, fitted_shape) where
+                            each array represents the respective parameter for n GEV distributions.
+
+        Returns:
+        np.ndarray: n x 1 array of quantiles for each GEV distribution.
+        """
+        fitted_loc, fitted_scale, fitted_shape = self.gev_params
+        n = len(fitted_loc)  # Number of GEV distributions
+        quantiles = np.zeros((n, 1))  # Initialize as an n x 1 array
+
+        for i in range(n):
+            # Use scipy's genextreme.ppf to compute the quantile
+            quantiles[i, 0] = genextreme.ppf(p, c=-fitted_shape[i], loc=fitted_loc[i], scale=fitted_scale[i]).item()
+
+        return quantiles
+
+    def data_plot(self, time, toggle=None):
+        """
+        Creates a scatter plot of self.endog against the given time vector. Optionally overlays
+        quantile lines at 0.05, 0.95 (green, bold) and 0.01, 0.99 (blue, dashed) based on `self.trans` 
+        or the `toggle` parameter.
+
+        Parameters:
+        - time: Array-like, representing the x-axis values (time points).
+        - toggle (bool, optional): If provided, overrides the self.trans attribute to toggle quantile lines.
+                                If None, falls back to using self.trans.
+        """
+        if len(time) != len(self.endog):
+            raise ValueError("Length of time vector must match the length of self.endog.")
+
+        # Determine whether to show quantile lines
+        show_quantiles = toggle if toggle is not None else self.trans
+
+        # Configure matplotlib for a modern font
+        rcParams['font.family'] = 'DejaVu Sans'
+        rcParams['font.size'] = 14
+
+        # Define a consistent, aesthetically pleasing color for all points
+        point_color = '#76C7C0'
+
+        # Create the scatter plot
+        plt.figure(figsize=(12, 8))
+        plt.scatter(time, self.endog, color=point_color, alpha=0.8, edgecolors='black', linewidth=0.5)
+
+        # Plot quantile lines if toggle is True or self.trans is True
+        if show_quantiles:
+            # Compute quantiles
+            q_05 = self.compute_gev_quantiles(0.05)
+            q_95 = self.compute_gev_quantiles(0.95)
+            q_01 = self.compute_gev_quantiles(0.01)
+            q_99 = self.compute_gev_quantiles(0.99)
+
+            # Add quantile lines
+            plt.plot(time, q_05.flatten(), color='green', linewidth=2, linestyle='-', label='5th & 95th Percentiles')
+            plt.plot(time, q_95.flatten(), color='green', linewidth=2, linestyle='-')
+            plt.plot(time, q_01.flatten(), color='blue', linewidth=2, linestyle='--', label='1st & 99th Percentiles')
+            plt.plot(time, q_99.flatten(), color='blue', linewidth=2, linestyle='--')
+
+            # Add legend inside the plot
+            plt.legend(
+                fontsize=12,
+                loc='upper left',
+                frameon=True,
+                facecolor='white',
+                edgecolor='black',
+                title="Quantile Lines"
+            )
+
+        # Add plot aesthetics
+        plt.title("Block Maximum Over Time with GEV Quantiles", fontsize=18, pad=15, fontweight='normal', color='darkslategray')
+        plt.xlabel("Time", fontsize=16, labelpad=10)
+        plt.ylabel("Values", fontsize=16, labelpad=10)
+
+        # Gridlines with light styling
+        plt.grid(True, linestyle='--', linewidth=0.6, alpha=0.6)
+
+        # Custom ticks
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+
+        # Tight layout to maximize use of space
+        plt.tight_layout()
+
+        # Show the plot
+        plt.show()
+
 
 if __name__ == "__main__":
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
     n = len(EOBS["prmax"].values.reshape(-1,1))
-    exog = {'scale':EOBS["tempanomalyMean"].values.reshape(-1,1)}
+    #tempanomalyMean
+    exog = {"location" : EOBS["tempanomalyMean"]}
     model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     gev_result_1 = model.fit()
-    gev_result_1.probability_plot()
-    plt.show()
+    #gev_result_1.probability_plot()
+    gev_result_1.data_plot(EOBS["year"].values)
