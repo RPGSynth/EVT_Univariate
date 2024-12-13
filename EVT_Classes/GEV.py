@@ -488,14 +488,184 @@ class GEVResult():
         # Show the plot
         plt.show()
 
+class GEV_WWA(GEV):
+    def __init__(self, endog, exog=None, loc_link=None, scale_link=None, shape_link=None, **kwargs):
+        super().__init__(endog, exog, loc_link, scale_link, shape_link, **kwargs)
 
+    def _process_data(self, endog, exog=None, **kwargs):
+        """
+        Processes and validates the endogenous and exogenous data.
+
+        Parameters
+        ----------
+        endog : array-like
+            Endogenous variable.
+        exog : dict or array-like, optional
+            Exogenous variables for parameters. Can be a single array (applied to all) or a dict with keys
+            'shape', 'location'.
+        kwargs : dict
+            Additional arguments for data handling.
+            
+        Returns
+        -------
+        dict
+            Processed data for internal use or external reference.
+        """
+        nobs = len(endog)
+
+        if exog is None:
+            # Initialize exog as a dictionary with ones as default values for each parameter
+            self.exog = {
+                'shape': np.ones((nobs, 1)),
+                'scale': np.ones((nobs, 1)),
+                'location': np.ones((nobs, 1))
+            }
+        elif isinstance(exog, np.ndarray):
+            if exog.shape[0] != nobs:
+                raise ValueError(
+                    f"The length of the provided exog array ({exog.shape[0]}) must match the length of `endog` ({nobs})."
+                )
+            if len(exog.shape) == 1:
+                exog_augmented = exog.reshape(-1,1)
+            else:
+                # Use the same `exog` array for all three parameters
+                exog_augmented = exog
+            self.exog = {
+                'shape': np.ones((nobs, 1)),
+                'scale': exog_augmented,
+                'location': exog_augmented
+            }
+        elif isinstance(exog, dict):
+            # Initialize the exog dictionary by iterating over the keys
+            self.exog = {}
+            if exog.get('shape') is not None:
+                raise ValueError ("The WWA model doesn't allow  a non stationnary shape")
+            for key in ['shape','scale', 'location']:
+                value = exog.get(key)
+                if value is None:
+                    self.exog[key] = np.ones((nobs, 1))
+                else:
+                    value_array = np.asarray(value)
+                    if value_array.shape[0] != nobs:
+                        raise ValueError(
+                            f"The number of rows in exog['{key}'] ({value_array.shape[0]}) "
+                            f"must match the number of rows in `endog` ({nobs})."
+                        )
+                    if len(value_array.shape) == 1:
+                        self.exog[key] = value_array.reshape(-1, 1)
+                    else:
+                        self.exog[key] = value_array
+        else:
+            raise ValueError("`exog` must be either a dictionary (default), or a NumPy array of shape (n,>=1).")
+        
+        if all(np.array_equal(self.exog[key], np.ones((nobs, 1))) for key in ['shape','scale', 'location']):
+            self.trans = False
+        else:
+            self.trans = True
+        
+        self.endog = np.asarray(endog).reshape(-1, 1)
+
+class GEV_WWA_Likelihood(GEV_WWA):
+    def __init__(self, endog, loc_link=GEV.exp_link, scale_link=GEV.exp_link, shape_link=GEV.identity, exog={'shape': None, 'scale': None, 'location': None}, **kwargs):
+        """
+        Initializes the GEVLikelihood model with given parameters.
+        """
+        super().__init__(endog=endog, exog=exog, loc_link=loc_link, scale_link=scale_link, shape_link=shape_link, **kwargs)
+        model_0 = GEVLikelihood(endog=self.endog,exog={}).fit()
+        self.mu_0 = model_0.gev_params[0][0][0]
+        self.sigma_0 = model_0.gev_params[1][0][0]
+        
+    def nloglike(self, params):
+        """
+        Computes the negative log-likelihood of the GEV model.
+        """
+        # Extract the number of covariates for each parameter
+        x1 = self.exog['location'].shape[1] 
+        x2 = self.exog['scale'].shape[1] 
+
+        # Compute location, scale, and shape parameters
+        location = self.mu_0 * self.loc_link(np.dot(self.exog['location'], params[:1].reshape(-1,1)) / self.mu_0)
+        scale = self.sigma_0 * self.scale_link(np.dot(self.exog['scale'], params[:1].reshape(-1,1)) / self.mu_0)
+        shape = self.shape_link(np.dot(self.exog['shape'],  params[1:2].reshape(-1,1)))
+        # GEV transformation
+        normalized_data = (self.endog - location) / scale
+        transformed_data = 1 + shape * normalized_data
+        # Return a large penalty for invalid parameter values
+        if np.any(transformed_data <= 0) or np.any(scale <= 0) or np.any(shape>=0.4):
+            return 1e6
+
+        return np.sum(np.log(scale)) + np.sum(transformed_data ** (-1 / shape)) + np.sum(np.log(transformed_data) * (1 / shape + 1))
+
+    def fit(self, start_params=None, method='L-BFGS-B', **kwargs):
+        """
+        Fits the model using maximum likelihood estimation.
+
+        Parameters
+        ----------
+        start_params : array_like, optional
+            Initial guess of the solution for the loglikelihood maximization.
+            The default is an array of zeros.
+        method : str, optional
+            The `method` determines which solver from `scipy.optimize`
+            is used, and it can be chosen from among the following strings:
+
+            - 'newton' for Newton-Raphson, 'nm' for Nelder-Mead
+            - 'bfgs' for Broyden-Fletcher-Goldfarb-Shanno (BFGS)
+            - 'lbfgs' for limited-memory BFGS with optional box constraints
+            - 'powell' for modified Powell's method
+            - 'cg' for conjugate gradient
+            - 'ncg' for Newton-conjugate gradient
+            - 'basinhopping' for global basin-hopping solver
+            - 'minimize' for generic wrapper of scipy minimize (BFGS by default)
+        """
+        if start_params is None:
+            start_params = np.array([1,0.1])
+        
+        # Compute plot_data based on transformation
+
+        self.fitted = True
+        self.result = minimize(self.nloglike, start_params, method=method, **kwargs)
+        self.result.endog = self.endog
+        self.result.len_endog = len(self.endog)
+        self.result.trans = self.trans
+
+        loc_end = self.exog['location'].shape[1]
+        scale_end = loc_end + self.exog['scale'].shape[1]
+        fitted_loc = self.mu_0 * self.loc_link(self.exog['location'] @ self.result.x[:loc_end] / self.mu_0).reshape(-1,1)
+        fitted_scale = self.sigma_0 * self.scale_link(self.exog['scale'] @ self.result.x[:loc_end] / self.mu_0).reshape(-1,1)
+        fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[loc_end:scale_end]).reshape(-1,1)
+        if self.trans:
+            plot_data = "a"
+        else:
+            plot_data = "b"
+
+        return GEVResult(
+            self.result,
+            endog=self.endog,
+            len_endog=len(self.endog),
+            trans=self.trans,
+            plot_data = plot_data,
+            gev_params = (fitted_loc,fitted_scale,fitted_shape)
+        )
+    
+
+    
 if __name__ == "__main__":
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
     n = len(EOBS["prmax"].values.reshape(-1,1))
     #tempanomalyMean
     exog = {"location" : EOBS["tempanomalyMean"]}
-    model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
-    gev_result_1 = model.fit()
+    #model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
+    #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
-    gev_result_1.data_plot(EOBS["year"].values)
+    #gev_result_1.data_plot(EOBS["year"].values)
+
+    #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    #test.data_plot(time=EOBS["year"])
+
+    #a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    #a1.data_plot(time=EOBS["year"])
+
+    a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit()
+    a2.data_plot(time=EOBS["year"],toggle=True)
