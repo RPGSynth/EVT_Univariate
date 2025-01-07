@@ -305,9 +305,8 @@ class GEVResult():
 
     def AIC(self):
         return 2 * self.nparams + 2 * self.log_likelihood
-
     def BIC(self):
-        return self.nparams * 1 + 2 * self.log_likelihood
+        return self.nparams * np.log(self.len_endog) + 2 * self.log_likelihood
 
     def SE(self):
         # Compute standard errors using the inverse Hessian matrix
@@ -655,17 +654,20 @@ if __name__ == "__main__":
 
     n = len(EOBS["prmax"].values.reshape(-1,1))
     #tempanomalyMean
-    exog = {"location" : EOBS["tempanomalyMean"]}
+    exog = {"location" : EOBS["tempanomalyMean"], "scale": EOBS["tempanomalyMean"]}
     #model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
     #gev_result_1.data_plot(EOBS["year"].values)
 
-    #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    #a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
 
     a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit()
-    a2.data_plot(time=EOBS["year"],toggle=True)
+    print(a1)
+    print(a2)
+    print(test)
+    #a2.data_plot(time=EOBS["year"],toggle=True)
