@@ -663,11 +663,8 @@ if __name__ == "__main__":
     test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit()
     #a1.data_plot(time=EOBS["year"])
 
     a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit()
     print(a1)
-    print(a2)
-    print(test)
-    #a2.data_plot(time=EOBS["year"],toggle=True)
