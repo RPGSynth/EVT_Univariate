@@ -407,72 +407,54 @@ class GEVFit():
                 )
             loc, scale, shape = self.gev_params[0][ref_year], self.gev_params[1][ref_year], self.gev_params[2][ref_year]
 
-        cov_matrix = self.hessian_inverse.todense()
+        
          # Compute the return level (Coles, 2001)
         y_p = -np.log(1 - 1/return_period)
+        if shape == 0 or np.isclose(1/return_period, 0):
+            z_p = loc - scale * np.log(y_p)
+        else:
+            z_p = loc - (scale / shape) * (1 - y_p**(-shape))
+        cov_matrix = self.hessian_inverse.todense()
 
         if not self.trans:
-            if shape == 0 or np.isclose(1/return_period, 0):
-                z_p = loc - scale * np.log(y_p)
-            else:
-                z_p = loc - (scale / shape) * (1 - y_p**(-shape))
-            
-            if method == "delta" and cov_matrix is not None:
-                # Compute gradient vector using Coles (2001) definition
-                if shape == 0:
-                    dL_dmu = 1
-                    dL_dsigma = -np.log(y_p)
-                    dL_dxi = 0
+            def compute_z_p(params):
+                loc, scale, shape = params
+                y_p = -np.log(1 - 1/return_period)
+                if shape == 0 or np.isclose(1/return_period, 0):
+                    return loc - scale * np.log(y_p)
                 else:
-                    dL_dmu = [1]
-                    dL_dsigma = - (1 / shape) * (1 - y_p**(-shape))
-                    dL_dxi = (scale / shape**2) * (1 - y_p**(-shape)) - (scale / shape) * y_p**(-shape) * np.log(y_p)
-                
-                gradient = np.concatenate([dL_dmu, dL_dsigma, dL_dxi]).reshape(-1,3)
-                # Estimate standard error using the delta method
-                variance = gradient @ cov_matrix @ gradient.T
-                std_error = np.sqrt(variance)
-                # Compute confidence interval
-                alpha = 1 - confidence
-                z_crit = norm.ppf(1 - alpha / 2)
-                ci_lower = z_p - z_crit * std_error
-                ci_upper = z_p + z_crit * std_error
-            else:
-                ci_lower, ci_upper = None, None
-            
-            return z_p[0], (ci_lower[0][0], ci_upper[0][0])
+                    return loc - (scale / shape) * (1 - y_p**(-shape))
+
+            params = np.array([loc, scale, shape])
+
         else:
             i, j, k = self.len_exog
-            
-            if shape == 0 or np.isclose(1/return_period, 0):
-                z_p = loc - scale * np.log(y_p)
-            else:
-                z_p = loc - (scale / shape) * (1 - y_p**(-shape))
-            
-            if method == "delta" and cov_matrix is not None:
-                i, j, k = self.len_exog
-                # Compute gradient vector (non stationary partial derivatives)
-                dL_dbeta = np.hstack(([1], self.exog['location'][ref_year][1:i]))  # 1 for intercept, X for others
-                if shape == 0:
-                    dL_dalpha = np.hstack((-np.log(y_p),-np.log(y_p) * self.exog['scale'][ref_year][1:j]))
-                    dL_dsigma = [0]*k
+            def compute_z_p(params):
+                loc = np.dot(self.exog['location'][ref_year][0:i],params[0:i])
+                scale = np.dot(self.exog['scale'][ref_year][0:j],params[i:i+j])
+                shape = np.dot(self.exog['shape'][ref_year][0:k],params[i+j:])
+                y_p = -np.log(1 - 1/return_period)
+                if shape == 0 or np.isclose(1/return_period, 0):
+                    return loc - scale * np.log(y_p)
                 else:
-                    dL_dalpha = np.hstack((- (1 / shape) * (1 - y_p**(-shape)), -(1 / shape) * (1 - y_p**(-shape)) * self.exog['scale'][ref_year][1:j]))
-                    dL_dsigma = np.hstack(((scale / shape**2) * (1 - y_p**(-shape)) - (scale / shape) * y_p**(-shape) * np.log(y_p) , (scale / shape**2) * (1 - y_p**(-shape)) * self.exog['shape'][ref_year][1:k] - (scale / shape) * y_p**(-shape) * np.log(y_p) * self.exog['shape'][ref_year][1:k]))
-                gradient = np.concatenate([dL_dbeta, dL_dalpha, dL_dsigma])
-                # Compute variance and standard error
-                variance = gradient @ cov_matrix @ gradient.T
-                std_error = np.sqrt(variance)
-                
-                # Compute confidence interval
-                alpha = 1 - confidence
-                z_crit = norm.ppf(1 - alpha / 2)
-                ci_lower = z_p - z_crit * std_error
-                ci_upper = z_p + z_crit * std_error
-            else:
-                ci_lower, ci_upper = None, None
+                    return loc - (scale / shape) * (1 - y_p**(-shape))
+
+            params = self.fitted_params
             
-            return z_p[0], (ci_lower[0], ci_upper[0])
+        
+        eps = np.sqrt(np.finfo(float).eps)
+        gradient = approx_fprime(params.flatten(), compute_z_p, eps).flatten()
+        # Estimate standard error using the delta method
+        variance = gradient @ cov_matrix @ gradient.T
+        std_error = np.sqrt(variance)
+                
+        # Compute confidence interval
+        alpha = 1 - confidence
+        z_crit = norm.ppf(1 - alpha / 2)
+        ci_lower = z_p - z_crit * std_error
+        ci_upper = z_p + z_crit * std_error
+            
+        return z_p[0], (ci_lower[0], ci_upper[0])
 
     def gevf(self,a, z):
         """
@@ -748,16 +730,23 @@ class GEV_WWA_Likelihood(GEV_WWA):
         else:
             plot_data = "b"
 
-        return GEVFit(
-            self.result,
+        return GEV_WWA_Fit(
+            optimize_result=self.result,
             endog=self.endog,
             len_endog=len(self.endog),
+            exog=self.exog,
+            len_exog=(self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1]),
             trans=self.trans,
             plot_data = plot_data,
             gev_params = (fitted_loc,fitted_scale,fitted_shape)
         )
     
+class GEV_WWA_Fit(GEVFit):
+    def __init__(self, optimize_result, endog, len_endog, exog, len_exog, trans, plot_data, gev_params):
+        super().__init__(optimize_result, endog, len_endog, exog, len_exog, trans, plot_data, gev_params)
 
+    def return_level(self, return_period, method="delta", confidence=0.95, ref_year=None):
+        return super().return_level(return_period, method, confidence, ref_year)
     
 if __name__ == "__main__":
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
@@ -773,8 +762,8 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit()
     #a1.data_plot(time=EOBS["year"])
 
-    e = a1.return_level(return_period=5,ref_year=0)
+    e = a1.return_level(return_period=5,ref_year=74)
     print(e)
