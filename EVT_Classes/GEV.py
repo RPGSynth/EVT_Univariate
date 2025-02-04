@@ -64,7 +64,7 @@ class GEV:
             raise ValueError("The `endog` parameter must not be None or empty. Please provide valid endogenous data.")
         
         # Store attributes
-        self.nobs = len(endog)
+        self.len_endog = len(endog)
         self.result = None
         self.fitted = False
         self.scale_guess = np.sqrt(6 * np.var(endog)) / np.pi
@@ -96,25 +96,23 @@ class GEV:
         dict
             Processed data for internal use or external reference.
         """
-        nobs = len(endog)
-
         if exog is None:
             # Initialize exog as a dictionary with ones as default values for each parameter
             self.exog = {
-                'shape': np.ones((nobs, 1)),
-                'scale': np.ones((nobs, 1)),
-                'location': np.ones((nobs, 1))
+                'shape': np.ones((self.len_endog, 1)),
+                'scale': np.ones((self.len_endog, 1)),
+                'location': np.ones((self.len_endog, 1))
             }
         elif isinstance(exog, np.ndarray):
-            if exog.shape[0] != nobs:
+            if exog.shape[0] != self.len_endog:
                 raise ValueError(
-                    f"The length of the provided exog array ({exog.shape[0]}) must match the length of `endog` ({nobs})."
+                    f"The length of the provided exog array ({exog.shape[0]}) must match the length of `endog` ({self.len_endog})."
                 )
             if len(exog.shape) == 1:
-                exog_augmented = np.concatenate([np.ones((nobs, 1)), exog.reshape(-1,1)], axis=1)
+                exog_augmented = np.concatenate([np.ones((self.len_endog, 1)), exog.reshape(-1,1)], axis=1)
             else:
                 # Use the same `exog` array for all three parameters
-                exog_augmented = np.concatenate([np.ones((nobs, 1)), exog], axis=1)
+                exog_augmented = np.concatenate([np.ones((self.len_endog, 1)), exog], axis=1)
             self.exog = {
                 'shape': exog_augmented,
                 'scale': exog_augmented,
@@ -126,27 +124,28 @@ class GEV:
             for key in ['shape', 'scale', 'location']:
                 value = exog.get(key)
                 if value is None:
-                    self.exog[key] = np.ones((nobs, 1))
+                    self.exog[key] = np.ones((self.len_endog, 1))
                 else:
                     value_array = np.asarray(value)
-                    if value_array.shape[0] != nobs:
+                    if value_array.shape[0] != self.len_endog:
                         raise ValueError(
                             f"The number of rows in exog['{key}'] ({value_array.shape[0]}) "
-                            f"must match the number of rows in `endog` ({nobs})."
+                            f"must match the number of rows in `endog` ({self.len_endog})."
                         )
                     if len(value_array.shape) == 1:
-                        self.exog[key] = np.concatenate([np.ones((nobs, 1)), value_array.reshape(-1, 1)], axis=1)
+                        self.exog[key] = np.concatenate([np.ones((self.len_endog, 1)), value_array.reshape(-1, 1)], axis=1)
                     else:
-                        self.exog[key] = np.concatenate([np.ones((nobs, 1)), value_array], axis=1)
+                        self.exog[key] = np.concatenate([np.ones((self.len_endog, 1)), value_array], axis=1)
         else:
             raise ValueError("`exog` must be either a dictionary (default), or a NumPy array of shape (n,>=1).")
         
-        if all(np.array_equal(self.exog[key], np.ones((nobs, 1))) for key in ['shape', 'scale', 'location']):
+        if all(np.array_equal(self.exog[key], np.ones((self.len_endog, 1))) for key in ['shape', 'scale', 'location']):
             self.trans = False
         else:
             self.trans = True
 
         self.endog = np.asarray(endog).reshape(-1, 1)
+        self.len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1])
 
     def fit(self):
         """
@@ -211,14 +210,12 @@ class GEVLikelihood(GEV):
         Computes the negative log-likelihood of the GEV model.
         """
         # Extract the number of covariates for each parameter
-        x1 = self.exog['location'].shape[1] 
-        x2 = self.exog['scale'].shape[1] 
-        x3 = self.exog['shape'].shape[1] 
-
+        i, j, k = self.len_exog
+        
         # Compute location, scale, and shape parameters
-        location = self.loc_link(np.dot(self.exog['location'], params[:x1].reshape(-1,1)))
-        scale = self.scale_link(np.dot(self.exog['scale'], params[x1:(x1 + x2)].reshape(-1,1)))
-        shape = self.shape_link(np.dot(self.exog['shape'], params[(x1 + x2):].reshape(-1,1)))
+        location = self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)))
+        scale = self.scale_link(np.dot(self.exog['scale'], params[i:i+j].reshape(-1,1)))
+        shape = self.shape_link(np.dot(self.exog['shape'], params[i+j:].reshape(-1,1)))
         # GEV transformation
         normalized_data = (self.endog - location) / scale
         transformed_data = 1 + shape * normalized_data
@@ -251,29 +248,27 @@ class GEVLikelihood(GEV):
             - 'basinhopping' for global basin-hopping solver
             - 'minimize' for generic wrapper of scipy minimize (BFGS by default)
         """
+        i,j,k = self.len_exog
+
         if start_params is None:
             start_params = np.array(
             [self.location_guess] +
-            ([0] * (self.exog['location'].shape[1] - 1)) +
+            ([0] * (i-1)) +
             [self.scale_guess] +
-            ([0] * (self.exog['scale'].shape[1] - 1)) +
+            ([0] * (j-1)) +
             [self.shape_guess] +
-            ([0] * (self.exog['shape'].shape[1] - 1))
+            ([0] * (k-1))
             )
         
         # Compute plot_data based on transformation
 
+        #Investigate fitted is it useful in the code ? I don't think so. 
         self.fitted = True
         self.result = minimize(self.nloglike, start_params, method=method, **kwargs)
-        self.result.endog = self.endog
-        self.result.len_endog = len(self.endog)
-        self.result.trans = self.trans
 
-        loc_end = self.exog['location'].shape[1]
-        scale_end = loc_end + self.exog['scale'].shape[1]
-        fitted_loc = self.loc_link(self.exog['location'] @ self.result.x[:loc_end]).reshape(-1,1)
-        fitted_scale = self.scale_link(self.exog['scale'] @ self.result.x[loc_end:scale_end]).reshape(-1,1)
-        fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[scale_end:]).reshape(-1,1)
+        fitted_loc = self.loc_link(self.exog['location'] @ self.result.x[:i]).reshape(-1,1)
+        fitted_scale = self.scale_link(self.exog['scale'] @ self.result.x[i:i+j]).reshape(-1,1)
+        fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[i+j:]).reshape(-1,1)
         if self.trans:
             plot_data = -np.log((1 + (fitted_shape * (self.endog - fitted_loc)) / fitted_scale) ** (-1 / fitted_shape))
         else:
@@ -282,9 +277,9 @@ class GEVLikelihood(GEV):
         return GEVFit(
             optimize_result = self.result,
             endog=self.endog,
-            len_endog=len(self.endog),
+            len_endog=self.len_endog,
             exog = self.exog,
-            len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1]),
+            len_exog = self.len_exog,
             trans=self.trans,
             plot_data = plot_data,
             gev_params = (fitted_loc,fitted_scale,fitted_shape)
@@ -766,7 +761,15 @@ class GEV_WWA_Fit(GEVFit):
         self.sigma0 = sigma0
         
 
+    #Override
     def return_level(self, return_period, method="delta", confidence=0.95, ref_year=None):
+        if ref_year is None:
+            raise ValueError(
+                "A reference year must be provided in a non-stationary model since return levels vary over time for a given return period.")
+        elif ref_year >= self.len_endog:
+            raise ValueError(
+                "You can not get the future return levels but only present or past return levels.")
+
         loc, scale, shape = self.gev_params[0][ref_year], self.gev_params[1][ref_year], self.gev_params[2][ref_year]
         y_p = -np.log(1 - 1/return_period)
         if shape == 0 or np.isclose(1/return_period, 0):
@@ -791,9 +794,10 @@ class GEV_WWA_Fit(GEVFit):
 if __name__ == "__main__":
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
+    EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
     n = len(EOBS["prmax"].values.reshape(-1,1))
     #tempanomalyMean
-    exog = {"location" : EOBS[["tempanomalyMean"]], "scale" : EOBS["tempanomalyMean"]}
+    exog = {"location" : EOBS["tempanomalyMean"], "scale" : EOBS["tempanomalyMean"]}
     #model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
@@ -802,9 +806,9 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    a1 = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
 
     #e = a1.return_level(return_period=5,ref_year=74)
-    print(a1.return_level(return_period=10,ref_year=60))
+    print(a1.return_level(return_period=10,ref_year=3))
