@@ -210,7 +210,7 @@ class GEVLikelihood(GEV):
         Computes the negative log-likelihood of the GEV model.
         """
         # Extract the number of covariates for each parameter
-        i, j, k = self.len_exog
+        i, j, _ = self.len_exog
         
         # Compute location, scale, and shape parameters
         location = self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)))
@@ -298,7 +298,7 @@ class GEVFit():
             self.plot_data = plot_data
             self.gev_params = gev_params
             self.log_likelihood = optimize_result.fun
-            self.hessian_inverse = optimize_result.hess_inv
+            self.cov_matrix = optimize_result.hess_inv
             self.jacobian = optimize_result.jac
             self.success = optimize_result.success
             self.nparams = self.fitted_params.size
@@ -310,10 +310,10 @@ class GEVFit():
 
     def SE(self):
         # Compute standard errors using the inverse Hessian matrix
-        if self.hessian_inverse is None:
+        if self.cov_matrix is None:
             raise ValueError("Hessian matrix is not available.")
-        hessian_inv = self.hessian_inverse.todense() if hasattr(self.hessian_inverse, 'todense') else self.hessian_inverse
-        se = np.sqrt(np.diag(hessian_inv))
+        cov_matrix = self.cov_matrix.todense() if hasattr(self.cov_matrix, 'todense') else self.cov_matrix
+        se = np.sqrt(np.diag(cov_matrix))
         return se
     
     def __str__(self):
@@ -452,7 +452,7 @@ class GEVFit():
             params = np.array([loc, scale, shape])
 
         else:
-            i, j, k = self.len_exog
+            i, j, _ = self.len_exog
             def compute_z_p(params):
                 loc = np.dot(self.exog['location'][ref_year][0:i],params[0:i])
                 scale = np.dot(self.exog['scale'][ref_year][0:j],params[i:i+j])
@@ -465,53 +465,24 @@ class GEVFit():
 
             params = self.fitted_params
             
-        return(self._compute_confidence_interval(params=params,cov_matrix=self.hessian_inverse.todense(),compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
-
-    def gevf(self,a, z):
-        """
-        Calculates the GEV distribution function (cdf) for given parameters.
-
-        Parameters:
-        a (list or array): MLE parameters for the GEV distribution [location, scale, shape]
-        z (array): Sorted data points
-                
-        Returns:
-        array: CDF values of the GEV model for data points
-        """
-        location, scale, shape = a[0], a[1], a[2]
-                
-        if shape != 0:
-            # Use the GEV CDF formula for non-zero shape
-            cdf_values = np.exp(- (1 + (shape * (z - location)) / scale) ** (-1 / shape))
-        else:
-            # If shape parameter is zero, use Gumbel distribution as a special case of GEV
-            cdf_values = np.exp(-np.exp(-(z - location) / scale))
-                
-        return cdf_values
-    
-    def gevq(self,p,a):
-        location, scale, shape = a[0], a[1], a[2]
-        if shape != 0:
-            return location + (scale * ((-np.log(1 - p))**(-shape) - 1)) / shape
-        else:
-            # Use Gumbel quantile from scipy.stats.gumbel_r
-            return gumbel_r.ppf(p, loc=location, scale=scale)
+        return(self._compute_confidence_interval(params=params,cov_matrix=self.cov_matrix.todense(),compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
         
-    def compute_gev_quantiles(self,p):
+    def _gev_params_to_quantiles(self,p):
         """
-        Computes the quantiles for multiple GEV distributions for a given probability p,
-        using the scipy.stats.genextreme library.
+        Computes quantiles for multiple GEV distributions given a probability p.
+
+        This function maps GEV distribution parameters (location, scale, shape) to 
+        corresponding quantile values using the inverse CDF (percent-point function).
 
         Parameters:
-        p (float): The probability for which to compute the quantiles (0 < p < 1).
-        gev_params (tuple): Tuple of arrays (fitted_loc, fitted_scale, fitted_shape) where
-                            each array represents the respective parameter for n GEV distributions.
+        p (float): Probability for which to compute the quantiles (0 < p < 1).
 
         Returns:
         np.ndarray: n x 1 array of quantiles for each GEV distribution.
         """
+
         fitted_loc, fitted_scale, fitted_shape = self.gev_params
-        n = len(fitted_loc)  # Number of GEV distributions
+        n = len(fitted_loc)  # Number of GEV fits (in time)
         quantiles = np.zeros((n, 1))  # Initialize as an n x 1 array
 
         for i in range(n):
@@ -520,6 +491,7 @@ class GEVFit():
 
         return quantiles
 
+    #To be remade
     def data_plot(self, time, toggle=None):
         """
         Creates a scatter plot of self.endog against the given time vector. Optionally overlays
@@ -551,10 +523,10 @@ class GEVFit():
         # Plot quantile lines if toggle is True or self.trans is True
         if show_quantiles:
             # Compute quantiles
-            q_05 = self.compute_gev_quantiles(0.05)
-            q_95 = self.compute_gev_quantiles(0.95)
-            q_01 = self.compute_gev_quantiles(0.01)
-            q_99 = self.compute_gev_quantiles(0.99)
+            q_05 = self._gev_params_to_quantiles()(0.05)
+            q_95 = self._gev_params_to_quantiles()(0.95)
+            q_01 = self._gev_params_to_quantiles()(0.01)
+            q_99 = self._gev_params_to_quantiles()(0.99)
 
             # Add quantile lines
             plt.plot(time, q_05.flatten(), color='green', linewidth=2, linestyle='-', label='5th & 95th Percentiles')
@@ -613,59 +585,74 @@ class GEV_WWA(GEV):
         dict
             Processed data for internal use or external reference.
         """
-        nobs = len(endog)
-
         if exog is None:
-            # Initialize exog as a dictionary with ones as default values for each parameter
-            self.exog = {
-                'shape': np.ones((nobs, 1)),
-                'scale': np.ones((nobs, 1)),
-                'location': np.ones((nobs, 1))
-            }
+            raise ValueError(
+                "The WWA model requires exogenous data. Compatible formats are dictionaries or numpy arrays."
+            )
+
         elif isinstance(exog, np.ndarray):
-            if exog.shape[0] != nobs:
+            if exog.shape[0] != self.len_endog:
                 raise ValueError(
-                    f"The length of the provided exog array ({exog.shape[0]}) must match the length of `endog` ({nobs})."
+                    f"The length of the provided exog array ({exog.shape[0]}) must match the length of `endog` ({self.len_endog})."
                 )
+
             if len(exog.shape) == 1:
-                exog_augmented = exog.reshape(-1,1)
+                exog_augmented = exog.reshape(-1, 1)
             else:
-                # Use the same `exog` array for all three parameters
                 exog_augmented = exog
+
             self.exog = {
-                'shape': np.ones((nobs, 1)),
-                'scale': exog_augmented,
-                'location': exog_augmented
+                "shape": np.ones((self.len_endog, 1)),
+                "scale": exog_augmented,
+                "location": exog_augmented,
             }
+
         elif isinstance(exog, dict):
-            # Initialize the exog dictionary by iterating over the keys
             self.exog = {}
-            if exog.get('shape') is not None:
-                raise ValueError ("The WWA model doesn't allow  a non stationnary shape")
-            for key in ['shape','scale', 'location']:
+
+            if exog.get("shape") is not None:
+                raise ValueError("The WWA model does not allow a non-stationary shape.")
+
+            for key in ["shape", "scale", "location"]:
                 value = exog.get(key)
+
                 if value is None:
-                    self.exog[key] = np.ones((nobs, 1))
+                    self.exog[key] = np.ones((self.len_endog, 1))
                 else:
                     value_array = np.asarray(value)
-                    if value_array.shape[0] != nobs:
+                    if value_array.shape[0] != self.len_endog:
                         raise ValueError(
                             f"The number of rows in exog['{key}'] ({value_array.shape[0]}) "
-                            f"must match the number of rows in `endog` ({nobs})."
+                            f"must match the number of rows in `endog` ({self.len_endog})."
                         )
                     if len(value_array.shape) == 1:
                         self.exog[key] = value_array.reshape(-1, 1)
                     else:
                         self.exog[key] = value_array
+
+            # Check if 'scale' and 'location' have the same size
+            if self.exog["scale"].shape != self.exog["location"].shape:
+                raise ValueError(
+                    f"The WWA model requires 'scale' and 'location' to have the same shape, "
+                    f"but got {self.exog['scale'].shape} and {self.exog['location'].shape}."
+                )
+
         else:
-            raise ValueError("`exog` must be either a dictionary (default), or a NumPy array of shape (n,>=1).")
-        
-        if all(np.array_equal(self.exog[key], np.ones((nobs, 1))) for key in ['shape','scale', 'location']):
-            self.trans = False
+            raise ValueError(
+                "`exog` must be either a dictionary (default) or a NumPy array of shape (n, >=1)."
+            )
+
+        # Determine if transformations are needed
+        if all(
+            np.array_equal(self.exog[key], np.ones((self.len_endog, 1)))
+            for key in ["shape", "scale", "location"]
+        ):
+            raise ValueError("The WWA model requires exogenous data for the location and the scale. Compatible formats are dictionaries or numpy arrays.")
         else:
             self.trans = True
         
         self.endog = np.asarray(endog).reshape(-1, 1)
+        self.len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1])
 
 class GEV_WWA_Likelihood(GEV_WWA):
     def __init__(self, endog, loc_link=GEV.exp_link, scale_link=GEV.exp_link, shape_link=GEV.identity, exog={'shape': None, 'scale': None, 'location': None}, **kwargs):
@@ -674,21 +661,19 @@ class GEV_WWA_Likelihood(GEV_WWA):
         """
         super().__init__(endog=endog, exog=exog, loc_link=loc_link, scale_link=scale_link, shape_link=shape_link, **kwargs)
         model_0 = GEVLikelihood(endog=self.endog,exog={}).fit()
-        self.mu_0 = model_0.gev_params[0][0][0]
-        self.sigma_0 = model_0.gev_params[1][0][0]
+        self.mu_0 = model_0.gev_params[0][0].item()
+        self.sigma_0 = model_0.gev_params[1][0].item()
         
     def nloglike(self, params):
         """
         Computes the negative log-likelihood of the GEV model.
         """
         # Extract the number of covariates for each parameter
-        x1 = self.exog['location'].shape[1] 
-        x2 = self.exog['scale'].shape[1] 
-
+        i,_,_ = self.len_exog
         # Compute location, scale, and shape parameters
-        location = self.mu_0 * self.loc_link(np.dot(self.exog['location'], params[:1].reshape(-1,1)) / self.mu_0)
-        scale = self.sigma_0 * self.scale_link(np.dot(self.exog['scale'], params[:1].reshape(-1,1)) / self.mu_0)
-        shape = self.shape_link(np.dot(self.exog['shape'],  params[1:2].reshape(-1,1)))
+        location = self.mu_0 * self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)) / self.mu_0)
+        scale = self.sigma_0 * self.scale_link(np.dot(self.exog['scale'], params[:i].reshape(-1,1)) / self.mu_0)
+        shape = self.shape_link(np.dot(self.exog['shape'],  params[i:].reshape(-1,1)))
         # GEV transformation
         normalized_data = (self.endog - location) / scale
         transformed_data = 1 + shape * normalized_data
@@ -720,22 +705,22 @@ class GEV_WWA_Likelihood(GEV_WWA):
             - 'basinhopping' for global basin-hopping solver
             - 'minimize' for generic wrapper of scipy minimize (BFGS by default)
         """
-        if start_params is None:
-            start_params = np.array([1,0.1])
-        
-        # Compute plot_data based on transformation
+        i,_,_ = self.len_exog
 
+        if start_params is None:
+            start_params = np.array(
+            [1]*(i) +
+            [self.shape_guess] 
+            )
+        
         self.fitted = True
         self.result = minimize(self.nloglike, start_params, method=method, **kwargs)
-        self.result.endog = self.endog
-        self.result.len_endog = len(self.endog)
-        self.result.trans = self.trans
 
-        loc_end = self.exog['location'].shape[1]
-        scale_end = loc_end + self.exog['scale'].shape[1]
-        fitted_loc = self.mu_0 * self.loc_link(self.exog['location'] @ self.result.x[:loc_end] / self.mu_0).reshape(-1,1)
-        fitted_scale = self.sigma_0 * self.scale_link(self.exog['scale'] @ self.result.x[:loc_end] / self.mu_0).reshape(-1,1)
-        fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[loc_end:scale_end]).reshape(-1,1)
+        fitted_loc = self.mu_0 * self.loc_link(self.exog['location'] @ self.result.x[:i] / self.mu_0).reshape(-1,1)
+        fitted_scale = self.sigma_0 * self.scale_link(self.exog['scale'] @ self.result.x[:i] / self.mu_0).reshape(-1,1)
+        fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[i:]).reshape(-1,1)
+
+        #To be Modified
         if self.trans:
             plot_data = "a"
         else:
@@ -787,7 +772,7 @@ class GEV_WWA_Fit(GEVFit):
                 return loc - scale * np.log(y_p)
             else:
                 return loc - (scale / shape) * (1 - y_p**(-shape))
-        return(self._compute_confidence_interval(params=self.fitted_params,cov_matrix=self.hessian_inverse.todense(),compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
+        return(self._compute_confidence_interval(params=self.fitted_params,cov_matrix=self.cov_matrix.todense(),compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
 
 
     
