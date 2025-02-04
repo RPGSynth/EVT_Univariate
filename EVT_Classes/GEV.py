@@ -367,7 +367,37 @@ class GEVFit():
         result_str += "Notes: *** p<0.001, ** p<0.01, * p<0.05\n"
         
         return result_str
-    
+
+    def _compute_confidence_interval(self, params, cov_matrix, compute_z_p, z_p, confidence=0.95):
+        """
+        Computes the confidence interval using the delta method.
+
+        Parameters:
+        - params: ndarray, model parameters
+        - compute_z_p: function, function to compute z_p
+        - cov_matrix: ndarray, covariance matrix
+        - z_p: ndarray, point estimate
+        - confidence: float, confidence level (default: 0.95)
+
+        Returns:
+        - z_p[0]: float, point estimate
+        - (ci_lower, ci_upper): tuple, confidence interval
+        """
+        eps = np.sqrt(np.finfo(float).eps)
+        gradient = approx_fprime(params.flatten(), compute_z_p, eps).flatten()
+
+        # Estimate standard error using the delta method
+        variance = gradient @ cov_matrix @ gradient.T
+        std_error = np.sqrt(variance)
+
+        # Compute confidence interval
+        alpha = 1 - confidence
+        z_crit = norm.ppf(1 - alpha / 2)
+        ci_lower = z_p - z_crit * std_error
+        ci_upper = z_p + z_crit * std_error
+
+        return z_p[0], (ci_lower[0], ci_upper[0])
+
     def return_level(self,return_period, method="delta", confidence=0.95, ref_year=None):
         """
         Computes the return level of the Generalized Extreme Value (GEV) distribution for a given return period T.
@@ -392,14 +422,14 @@ class GEVFit():
         if not self.trans:
             if ref_year is not None:
                 warnings.warn(
-                    "Reference years are not required in a stationary model. Each year has the same return level.",
+                    "Reference years are not required in a stationary model. Each year has the same return level for a given return period.",
                     UserWarning
                 )
             loc, scale, shape = self.gev_params[0][0], self.gev_params[1][0], self.gev_params[2][0]
         else:
             if ref_year is None:
                 raise ValueError(
-                    "A reference year must be provided in a non-stationary model since return levels vary over time."
+                    "A reference year must be provided in a non-stationary model since return levels vary over time for a given return period."
                 )
             elif ref_year >= self.len_endog:
                 raise ValueError(
@@ -414,7 +444,6 @@ class GEVFit():
             z_p = loc - scale * np.log(y_p)
         else:
             z_p = loc - (scale / shape) * (1 - y_p**(-shape))
-        cov_matrix = self.hessian_inverse.todense()
 
         if not self.trans:
             def compute_z_p(params):
@@ -441,20 +470,7 @@ class GEVFit():
 
             params = self.fitted_params
             
-        
-        eps = np.sqrt(np.finfo(float).eps)
-        gradient = approx_fprime(params.flatten(), compute_z_p, eps).flatten()
-        # Estimate standard error using the delta method
-        variance = gradient @ cov_matrix @ gradient.T
-        std_error = np.sqrt(variance)
-                
-        # Compute confidence interval
-        alpha = 1 - confidence
-        z_crit = norm.ppf(1 - alpha / 2)
-        ci_lower = z_p - z_crit * std_error
-        ci_upper = z_p + z_crit * std_error
-            
-        return z_p[0], (ci_lower[0], ci_upper[0])
+        return(self._compute_confidence_interval(params=params,cov_matrix=self.hessian_inverse.todense(),compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
 
     def gevf(self,a, z):
         """
@@ -738,22 +754,46 @@ class GEV_WWA_Likelihood(GEV_WWA):
             len_exog=(self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1]),
             trans=self.trans,
             plot_data = plot_data,
-            gev_params = (fitted_loc,fitted_scale,fitted_shape)
+            gev_params = (fitted_loc,fitted_scale,fitted_shape),
+            mu0 = self.mu_0,
+            sigma0 = self.sigma_0
         )
     
 class GEV_WWA_Fit(GEVFit):
-    def __init__(self, optimize_result, endog, len_endog, exog, len_exog, trans, plot_data, gev_params):
+    def __init__(self, optimize_result, endog, len_endog, exog, len_exog, trans, plot_data, gev_params, mu0, sigma0):
         super().__init__(optimize_result, endog, len_endog, exog, len_exog, trans, plot_data, gev_params)
+        self.mu0 = mu0
+        self.sigma0 = sigma0
+        
 
     def return_level(self, return_period, method="delta", confidence=0.95, ref_year=None):
-        return super().return_level(return_period, method, confidence, ref_year)
+        loc, scale, shape = self.gev_params[0][ref_year], self.gev_params[1][ref_year], self.gev_params[2][ref_year]
+        y_p = -np.log(1 - 1/return_period)
+        if shape == 0 or np.isclose(1/return_period, 0):
+            z_p = loc - scale * np.log(y_p)
+        else:
+            z_p = loc - (scale / shape) * (1 - y_p**(-shape))
+
+        def compute_z_p(params):
+            loc = self.mu0 * np.exp(np.dot(self.exog['location'][ref_year][0], params[0]).item() / self.mu0)
+            scale = self.sigma0 * np.exp(np.dot(self.exog['scale'][ref_year][0], params[0]).item() / self.mu0)
+            #To change for larger WWA model. 
+            shape = params[1]
+            y_p = -np.log(1 - 1/return_period)
+            if shape == 0 or np.isclose(1/return_period, 0):
+                return loc - scale * np.log(y_p)
+            else:
+                return loc - (scale / shape) * (1 - y_p**(-shape))
+        return(self._compute_confidence_interval(params=self.fitted_params,cov_matrix=self.hessian_inverse.todense(),compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
+
+
     
 if __name__ == "__main__":
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
     n = len(EOBS["prmax"].values.reshape(-1,1))
     #tempanomalyMean
-    exog = {"location" : EOBS["tempanomalyMean"]}
+    exog = {"location" : EOBS[["tempanomalyMean"]], "scale" : EOBS["tempanomalyMean"]}
     #model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
@@ -762,8 +802,9 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit()
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
 
-    e = a1.return_level(return_period=5,ref_year=74)
-    print(e)
+    #e = a1.return_level(return_period=5,ref_year=74)
+    print(a1.return_level(return_period=10,ref_year=60))
