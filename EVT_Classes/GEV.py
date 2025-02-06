@@ -1,22 +1,19 @@
+# Standard library imports
 import os
 import warnings
+
+# Third-party library imports
+import numpy as np
 import pandas as pd
 import xarray as xr
-import matplotlib.pyplot as plt
-from matplotlib import rcParams
-import numpy as np
-from scipy.optimize import minimize
-from statsmodels.base.model import GenericLikelihoodModel
-import numpy as np
-import pandas as pd
 import numdifftools as nd
 import statsmodels.api as sm
-from scipy.optimize import approx_fprime
-from scipy.stats import norm
-from scipy.stats import chi2
-from scipy.stats import gumbel_r
-from scipy.stats import genextreme
-
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+from scipy.optimize import minimize, approx_fprime
+from scipy.stats import norm, chi2, gumbel_r, genextreme
+from statsmodels.base.model import GenericLikelihoodModel
 class GEV:
     """
     A statistical model supporting GEV models.
@@ -452,7 +449,7 @@ class GEVFit():
             params = np.array([loc, scale, shape])
 
         else:
-            i, j, _ = self.len_exog
+            i, j, k = self.len_exog
             def compute_z_p(params):
                 loc = np.dot(self.exog['location'][ref_year][0:i],params[0:i])
                 scale = np.dot(self.exog['scale'][ref_year][0:j],params[i:i+j])
@@ -466,7 +463,38 @@ class GEVFit():
             params = self.fitted_params
             
         return(self._compute_confidence_interval(params=params,cov_matrix=self.cov_matrix.todense(),compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
-        
+
+    def _return_level_plot_values(self, method="delta", confidence=0.95, ref_year=None):
+        all_return_periods = np.empty(len(np.arange(1.1, 1000, 0.5)))
+        all_return_levels = np.empty(len(np.arange(1.1, 1000, 0.5)))  # Determine the number of iterations
+        all_ci_lower = np.empty(len(np.arange(1.1, 1000, 0.5)))
+        all_ci_upper = np.empty(len(np.arange(1.1, 1000, 0.5)))
+
+        for i, T in enumerate(np.arange(1.1, 1000, 0.5)):
+            z_p, ci = self.return_level(T,method,confidence,ref_year)
+            all_return_periods[i] = T
+            all_return_levels[i] = z_p
+            all_ci_lower[i], all_ci_upper[i] = ci
+        return all_return_periods, all_return_levels, all_ci_lower, all_ci_upper
+
+
+    def return_level_plot(self,method="delta",confidence=0.95,ref_year=None):
+        all_return_periods, all_return_levels, all_ci_lower, all_ci_upper = self._return_level_plot_values(method,confidence,ref_year)
+
+        fig = go.Figure(go.Scatter(x=all_return_periods,y=all_return_levels,mode="lines",name="Return level Curve",line_color = "blue"))
+
+        fig.add_trace(go.Scatter(x=np.concatenate([all_return_periods, all_return_periods[::-1]]),
+                         y=np.concatenate([all_ci_upper, all_ci_lower[::-1]])))
+
+        # Customize layout
+        fig.update_layout(title='Return Level Plot with Confidence Interval',
+                        xaxis_title='Return Period (Years)',
+                        yaxis_title='Return Level',
+                        template='plotly_white')
+
+        # Show the plot
+        fig.show()
+
     def _gev_params_to_quantiles(self,p):
         """
         Computes quantiles for multiple GEV distributions given a probability p.
@@ -791,9 +819,9 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit()
     #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
 
     #e = a1.return_level(return_period=5,ref_year=74)
-    print(a1.return_level(return_period=10,ref_year=3))
+    print(a1.return_level_plot()[0])
