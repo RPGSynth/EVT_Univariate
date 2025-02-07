@@ -70,6 +70,8 @@ class GEV:
         self.loc_link = loc_link or self.identity
         self.scale_link = scale_link or self.identity
         self.shape_link = shape_link or self.identity
+        self._forced_param_index = -1
+        self._forced_param_value = 0
 
         # Handle data
         self._process_data(endog, exog, **kwargs)
@@ -143,6 +145,7 @@ class GEV:
 
         self.endog = np.asarray(endog).reshape(-1, 1)
         self.len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1])
+        self.nparams = self.len_exog[0]+self.len_exog[1]+self.len_exog[2]
 
     def fit(self):
         """
@@ -201,13 +204,26 @@ class GEVLikelihood(GEV):
             return self.result.jac
         else:
             raise ValueError("Model is not fitted. Cannot compute the score at optimal parameters.")
+        
+    def _nloglike_formula(self,transformed_data,scale,shape):
+        return np.sum(np.log(scale)) + np.sum(transformed_data ** (-1 / shape)) + np.sum(np.log(transformed_data) * (1 + 1 / shape))
 
-    def nloglike(self, params):
+    def nloglike(self, free_params):
         """
         Computes the negative log-likelihood of the GEV model.
         """
+
         # Extract the number of covariates for each parameter
         i, j, _ = self.len_exog
+        params = np.ones(self.nparams)
+        free_index = 0
+
+        for k in range(self.nparams):  # Total number of parameters
+            if k == self._forced_param_index:
+                params[k] = self._forced_param_value  # Use fixed parameter value
+            else:
+                params[k] = free_params[free_index] # Use optimized parameter
+                free_index += 1
         
         # Compute location, scale, and shape parameters
         location = self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)))
@@ -220,10 +236,13 @@ class GEVLikelihood(GEV):
         if np.any(transformed_data <= 0) or np.any(scale <=0):
             return 1e6
 
-        return np.sum(np.log(scale)) + np.sum(transformed_data ** (-1 / shape)) + np.sum(np.log(transformed_data) * (1 / shape + 1))
+        return self._nloglike_formula(transformed_data,scale,shape)
     
 
-    def fit(self, start_params=None, method='L-BFGS-B', **kwargs):
+    def loglike(self,params):
+        return -(self.nloglike(params))
+
+    def fit(self, start_params=None, optim_method='L-BFGS-B', fit_method ='MLE', **kwargs):
         """
         Fits the model using maximum likelihood estimation.
 
@@ -246,41 +265,79 @@ class GEVLikelihood(GEV):
             - 'minimize' for generic wrapper of scipy minimize (BFGS by default)
         """
         i,j,k = self.len_exog
+        if fit_method.lower() == 'mle':
+            if start_params is None:
+                free_params = np.array(
+                [self.location_guess] +
+                ([0] * (i-1)) +
+                [self.scale_guess] +
+                ([0] * (j-1)) +
+                [self.shape_guess] +
+                ([0] * (k-1))
+                )
+            
+            # Compute plot_data based on transformation
 
-        if start_params is None:
-            start_params = np.array(
-            [self.location_guess] +
-            ([0] * (i-1)) +
-            [self.scale_guess] +
-            ([0] * (j-1)) +
-            [self.shape_guess] +
-            ([0] * (k-1))
+            #Investigate fitted is it useful in the code ? I don't think so. 
+            self.result = minimize(self.nloglike, free_params, method=optim_method, **kwargs)
+
+            fitted_loc = self.loc_link(self.exog['location'] @ self.result.x[:i]).reshape(-1,1)
+            fitted_scale = self.scale_link(self.exog['scale'] @ self.result.x[i:i+j]).reshape(-1,1)
+            fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[i+j:]).reshape(-1,1)
+            if self.trans:
+                plot_data = -np.log((1 + (fitted_shape * (self.endog - fitted_loc)) / fitted_scale) ** (-1 / fitted_shape))
+            else:
+                plot_data = self.endog
+
+            return GEVFit(
+                optimize_result = self.result,
+                endog=self.endog,
+                len_endog=self.len_endog,
+                exog = self.exog,
+                len_exog = self.len_exog,
+                trans=self.trans,
+                plot_data = plot_data,
+                gev_params = (fitted_loc,fitted_scale,fitted_shape)
             )
-        
-        # Compute plot_data based on transformation
-
-        #Investigate fitted is it useful in the code ? I don't think so. 
-        self.fitted = True
-        self.result = minimize(self.nloglike, start_params, method=method, **kwargs)
-
-        fitted_loc = self.loc_link(self.exog['location'] @ self.result.x[:i]).reshape(-1,1)
-        fitted_scale = self.scale_link(self.exog['scale'] @ self.result.x[i:i+j]).reshape(-1,1)
-        fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[i+j:]).reshape(-1,1)
-        if self.trans:
-            plot_data = -np.log((1 + (fitted_shape * (self.endog - fitted_loc)) / fitted_scale) ** (-1 / fitted_shape))
         else:
-            plot_data = self.endog
+            n=500
+            profile_mles = np.empty((self.nparams,n))
+            param_values = np.empty((self.nparams,n))
+            fits = np.empty(self.nparams)
+            for l in range(self.nparams):
+                if l == 0:
+                    profile_params = np.linspace(self.location_guess / 5, self.location_guess * 2, n)
+                elif l == i:
+                    profile_params = np.linspace(self.scale_guess / 5, self.scale_guess * 2, n)
+                elif l == i + j:
+                    profile_params = np.linspace(-0.6, 0.6, n)
+                else:
+                    profile_params = np.linspace(-50, 50, n)
 
-        return GEVFit(
-            optimize_result = self.result,
-            endog=self.endog,
-            len_endog=self.len_endog,
-            exog = self.exog,
-            len_exog = self.len_exog,
-            trans=self.trans,
-            plot_data = plot_data,
-            gev_params = (fitted_loc,fitted_scale,fitted_shape)
-        )
+                free_params = []  # Initialize an empty list
+                for param_index in range(self.nparams):
+                    if param_index == l:
+                        continue  # Skip the fixed parameter
+                    if param_index == 0:
+                        free_params.append(self.location_guess)
+                    elif param_index == i:
+                        free_params.append(self.scale_guess)
+                    elif param_index == i+j:
+                        free_params.append(self.shape_guess)
+                    else:
+                        free_params.append(0)
+
+                # Loop only over values in all_mus
+                for m, param_value in enumerate(profile_params):
+                    self._forced_param_value = param_value  # Update only this value per iteration
+                    self._forced_param_index = l
+                    result = minimize(self.nloglike, free_params, method=optim_method, **kwargs)
+                    profile_mles[l][m] = result.fun
+                    param_values[l][m] = param_value
+
+            for n in range(self.nparams):
+                fits[n] = param_values[n][np.argmin(profile_mles[n])]
+            return fits
 
 
 class GEVFit():
@@ -819,9 +876,10 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit()
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit(fit_method='i')
+    print(a1)
     #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
 
     #e = a1.return_level(return_period=5,ref_year=74)
-    print(a1.return_level_plot()[0])
+    #a1.return_level_plot()
