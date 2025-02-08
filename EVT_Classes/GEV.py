@@ -14,6 +14,11 @@ from matplotlib import rcParams
 from scipy.optimize import minimize, approx_fprime
 from scipy.stats import norm, chi2, gumbel_r, genextreme
 from statsmodels.base.model import GenericLikelihoodModel
+from concurrent.futures import ThreadPoolExecutor
+from joblib import Parallel, delayed
+from functools import partial
+import time
+
 class GEV:
     """
     A statistical model supporting GEV models.
@@ -204,11 +209,8 @@ class GEVLikelihood(GEV):
             return self.result.jac
         else:
             raise ValueError("Model is not fitted. Cannot compute the score at optimal parameters.")
-        
-    def _nloglike_formula(self,transformed_data,scale,shape):
-        return np.sum(np.log(scale)) + np.sum(transformed_data ** (-1 / shape)) + np.sum(np.log(transformed_data) * (1 + 1 / shape))
 
-    def nloglike(self, free_params):
+    def nloglike(self, free_params, forced_index=-1,forced_param_value=0):
         """
         Computes the negative log-likelihood of the GEV model.
         """
@@ -219,8 +221,8 @@ class GEVLikelihood(GEV):
         free_index = 0
 
         for k in range(self.nparams):  # Total number of parameters
-            if k == self._forced_param_index:
-                params[k] = self._forced_param_value  # Use fixed parameter value
+            if k == forced_index:
+                params[k] = forced_param_value  # Use fixed parameter value
             else:
                 params[k] = free_params[free_index] # Use optimized parameter
                 free_index += 1
@@ -236,11 +238,13 @@ class GEVLikelihood(GEV):
         if np.any(transformed_data <= 0) or np.any(scale <=0):
             return 1e6
 
-        return self._nloglike_formula(transformed_data,scale,shape)
+        return np.sum(np.log(scale)) + np.sum(transformed_data ** (-1 / shape)) + np.sum(np.log(transformed_data) * (1 + 1 / shape))
     
-
     def loglike(self,params):
         return -(self.nloglike(params))
+    
+    def _parallel_minimize():
+        return 0
 
     def fit(self, start_params=None, optim_method='L-BFGS-B', fit_method ='MLE', **kwargs):
         """
@@ -300,10 +304,11 @@ class GEVLikelihood(GEV):
                 gev_params = (fitted_loc,fitted_scale,fitted_shape)
             )
         else:
-            n=500
+            n=100
             profile_mles = np.empty((self.nparams,n))
             param_values = np.empty((self.nparams,n))
-            fits = np.empty(self.nparams)
+            estims = np.empty(self.nparams)
+            CIs = np.empty(self.nparams)
             for l in range(self.nparams):
                 if l == 0:
                     profile_params = np.linspace(self.location_guess / 5, self.location_guess * 2, n)
@@ -328,16 +333,49 @@ class GEVLikelihood(GEV):
                         free_params.append(0)
 
                 # Loop only over values in all_mus
-                for m, param_value in enumerate(profile_params):
-                    self._forced_param_value = param_value  # Update only this value per iteration
-                    self._forced_param_index = l
-                    result = minimize(self.nloglike, free_params, method=optim_method, **kwargs)
-                    profile_mles[l][m] = result.fun
-                    param_values[l][m] = param_value
+                #start_time = time.time()
+                #for m, param_value in enumerate(profile_params):
+                    #forced_index = l
+                    #nloglike_partial = partial(self.nloglike,forced_index=forced_index,forced_param_value=param_value)
+                    #result = minimize(nloglike_partial, free_params, method=optim_method, **kwargs)
+                    #profile_mles[l][m] = result.fun
+                    #param_values[l][m] = param_value
+                #end_time = time.time()
+                #elapsed_time = end_time - start_time
+                #print(f"Execution Time: {elapsed_time:.4f} seconds")
 
-            for n in range(self.nparams):
-                fits[n] = param_values[n][np.argmin(profile_mles[n])]
-            return fits
+            l = 0
+            free_params = [14,0.1]
+            test = np.empty(len(profile_params))
+            profile_params = np.linspace(self.location_guess / 5, self.location_guess * 2, n)
+            start_time = time.time()
+            results = Parallel(n_jobs=-1)(
+                delayed(self._optimize_nloglike_parallel)(l, param_value, free_params, optim_method, m)
+                for m, param_value in enumerate(profile_params))
+                #Stop timing
+            end_time = time.time()
+
+            # Print execution time
+            elapsed_time = end_time - start_time
+            print(f"Execution Time: {elapsed_time:.4f} seconds")
+            return 0
+
+    #Made to be run in a parallel computing framework 
+    def _optimize_nloglike_parallel(self,forced_index,forced_param_value,free_params,optim_method, m):
+        nloglike_partial = partial(self.nloglike,forced_index=forced_index,forced_param_value=forced_param_value)
+        result = minimize(nloglike_partial, free_params, method=optim_method)
+        return m, result.fun, forced_param_value
+    
+    def _future_method(self):
+        #for n in range(self.nparams):
+            #estims[n] = param_values[n][np.argmin(profile_mles[n])]
+            #threshold   = chi2.ppf(0.95, df=1)/2
+            #cutoff = profile_mles[0] - profile_mles[0][np.argmin(profile_mles[0])]
+            #indices = np.where(cutoff<=threshold)[0]
+
+            #lower_bound = param_values[0][indices[0]]  # First valid theta value
+            #upper_bound = param_values[0][indices[-1]]
+        return 0
 
 
 class GEVFit():
@@ -876,7 +914,7 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit(fit_method='i')
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit(fit_method='i')
     print(a1)
     #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
