@@ -14,7 +14,7 @@ from matplotlib import rcParams
 from scipy.optimize import minimize, approx_fprime
 from scipy.stats import norm, chi2, gumbel_r, genextreme
 from statsmodels.base.model import GenericLikelihoodModel
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from joblib import Parallel, delayed
 from functools import partial
 import time
@@ -243,8 +243,29 @@ class GEVLikelihood(GEV):
     def loglike(self,params):
         return -(self.nloglike(params))
     
-    def _parallel_minimize():
-        return 0
+
+    def generate_profile_params(self, param_idx, n):
+        """Generate profile parameter values based on param index rules."""
+        i, j, k = self.len_exog  # Extract external indices
+        
+        param_ranges = {
+            0: np.linspace(self.location_guess / 5, self.location_guess * 2, n),
+            i: np.linspace(self.scale_guess / 5, self.scale_guess * 2, n),
+            i + j: np.linspace(-0.6, 0.6, n)
+        }
+        return param_ranges.get(param_idx, np.linspace(-50, 50, n))
+
+    def generate_free_params(self,param_idx):
+        """Efficient single-loop version of the parameter profiling process."""
+        i, j, k = self.len_exog  # Extract external indices
+
+        # Predefine default values for free parameters
+        default_params = [self.location_guess if idx == 0 else
+                          self.scale_guess if idx == i else
+                          self.shape_guess if idx == i + j else 0
+                          for idx in range(self.nparams)]
+        free_params = default_params[:param_idx] + default_params[param_idx+1:]
+        return free_params  
 
     def fit(self, start_params=None, optim_method='L-BFGS-B', fit_method ='MLE', **kwargs):
         """
@@ -304,70 +325,41 @@ class GEVLikelihood(GEV):
                 gev_params = (fitted_loc,fitted_scale,fitted_shape)
             )
         else:
-            n=100
-            profile_mles = np.empty((self.nparams,n))
-            param_values = np.empty((self.nparams,n))
-            estims = np.empty(self.nparams)
-            CIs = np.empty(self.nparams)
-            for l in range(self.nparams):
-                if l == 0:
-                    profile_params = np.linspace(self.location_guess / 5, self.location_guess * 2, n)
-                elif l == i:
-                    profile_params = np.linspace(self.scale_guess / 5, self.scale_guess * 2, n)
-                elif l == i + j:
-                    profile_params = np.linspace(-0.6, 0.6, n)
-                else:
-                    profile_params = np.linspace(-50, 50, n)
+            n=1000
+            all_profile_mles = np.empty((self.nparams,n))
+            all_param_values = np.empty((self.nparams,n))
+            args = [(param_idx, n, optim_method) for param_idx in range(self.nparams)]
 
-                free_params = []  # Initialize an empty list
-                for param_index in range(self.nparams):
-                    if param_index == l:
-                        continue  # Skip the fixed parameter
-                    if param_index == 0:
-                        free_params.append(self.location_guess)
-                    elif param_index == i:
-                        free_params.append(self.scale_guess)
-                    elif param_index == i+j:
-                        free_params.append(self.shape_guess)
-                    else:
-                        free_params.append(0)
+            start_time = time.perf_counter()
+            with ProcessPoolExecutor() as executor:
+                for param_idx, profile_mles, param_values in executor.map(self._optimize_profile_parallel, args):
+                    all_profile_mles[param_idx] = profile_mles
+                    all_param_values[param_idx] = param_values
 
-                # Loop only over values in all_mus
-                #start_time = time.time()
-                #for m, param_value in enumerate(profile_params):
-                    #forced_index = l
-                    #nloglike_partial = partial(self.nloglike,forced_index=forced_index,forced_param_value=param_value)
-                    #result = minimize(nloglike_partial, free_params, method=optim_method, **kwargs)
-                    #profile_mles[l][m] = result.fun
-                    #param_values[l][m] = param_value
-                #end_time = time.time()
-                #elapsed_time = end_time - start_time
-                #print(f"Execution Time: {elapsed_time:.4f} seconds")
+            end_time = time.perf_counter()
+            execution_time = end_time - start_time
+            print(f"Execution Time: {execution_time:.4f} seconds")
 
-            l = 0
-            free_params = [14,0.1]
-            test = np.empty(len(profile_params))
-            profile_params = np.linspace(self.location_guess / 5, self.location_guess * 2, n)
-            start_time = time.time()
-            results = Parallel(n_jobs=-1)(
-                delayed(self._optimize_nloglike_parallel)(l, param_value, free_params, optim_method, m)
-                for m, param_value in enumerate(profile_params))
-                #Stop timing
-            end_time = time.time()
-
-            # Print execution time
-            elapsed_time = end_time - start_time
-            print(f"Execution Time: {elapsed_time:.4f} seconds")
-            return 0
+            return all_param_values[0][np.argmin(all_profile_mles[0])]
 
     #Made to be run in a parallel computing framework 
-    def _optimize_nloglike_parallel(self,forced_index,forced_param_value,free_params,optim_method, m):
-        nloglike_partial = partial(self.nloglike,forced_index=forced_index,forced_param_value=forced_param_value)
-        result = minimize(nloglike_partial, free_params, method=optim_method)
-        return m, result.fun, forced_param_value
+    def _optimize_profile_parallel(self,args):
+        param_idx,n,optim_method = args
+        profile_mles = np.empty(n)
+        param_values = np.empty(n)
+
+        profile_params = self.generate_profile_params(param_idx=param_idx,n=n)
+        free_params = self.generate_free_params(param_idx=param_idx)
+        for n_i, param_value in enumerate(profile_params):
+                    nloglike_partial = partial(self.nloglike,forced_index=param_idx,forced_param_value=param_value)
+                    result = minimize(nloglike_partial, free_params, method=optim_method)
+                    profile_mles[n_i] = result.fun
+                    param_values[n_i] = param_value
+        
+        return param_idx, profile_mles, param_values
     
     def _future_method(self):
-        #for n in range(self.nparams):
+        #for n in range(selvf.nparams):
             #estims[n] = param_values[n][np.argmin(profile_mles[n])]
             #threshold   = chi2.ppf(0.95, df=1)/2
             #cutoff = profile_mles[0] - profile_mles[0][np.argmin(profile_mles[0])]
@@ -905,7 +897,7 @@ if __name__ == "__main__":
     EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
     n = len(EOBS["prmax"].values.reshape(-1,1))
     #tempanomalyMean
-    exog = {"location" : EOBS["tempanomalyMean"], "scale" : EOBS["tempanomalyMean"]}
+    exog = {"location" : EOBS[["tempanomalyMean"]]}
     #model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
@@ -914,7 +906,7 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit(fit_method='i')
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit(fit_method="i")
     print(a1)
     #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
