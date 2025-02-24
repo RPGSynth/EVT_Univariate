@@ -233,39 +233,58 @@ class GEVLikelihood(GEV):
         shape = self.shape_link(np.dot(self.exog['shape'], params[i+j:].reshape(-1,1)))
         # GEV transformation
         normalized_data = (self.endog - location) / scale
-        transformed_data = 1 + shape * normalized_data
-        # Return a large penalty for invalid parameter values
-        if np.any(transformed_data <= 0) or np.any(scale <=0):
-            return 1e6
+        if np.allclose(shape, 0):  # Treat shape = 0 separately
+            log_likelihood = (
+                np.sum(np.log(scale))
+                + np.sum(normalized_data)
+                + np.sum(np.exp(-normalized_data))
+            )
+        else:
+            # Standard GEV transformation
+            transformed_data = 1 + shape * normalized_data
 
-        return np.sum(np.log(scale)) + np.sum(transformed_data ** (-1 / shape)) + np.sum(np.log(transformed_data) * (1 + 1 / shape))
+            # Return a large penalty for invalid parameter values
+            if np.any(transformed_data <= 0) or np.any(scale <= 0):
+                return 1e6
+
+            log_likelihood = (
+                np.sum(np.log(scale))
+                + np.sum(transformed_data ** (-1 / shape))
+                + np.sum(np.log(transformed_data) * (1 + 1 / shape))
+            )
+
+        return log_likelihood 
     
     def loglike(self,params):
         return -(self.nloglike(params))
     
 
-    def generate_profile_params(self, param_idx, n):
+    def generate_profile_params(self, param_idx, n,mle_params):
         """Generate profile parameter values based on param index rules."""
         i, j, k = self.len_exog  # Extract external indices
         
         param_ranges = {
-            0: np.linspace(self.location_guess / 5, self.location_guess * 2, n),
-            i: np.linspace(self.scale_guess / 5, self.scale_guess * 2, n),
-            i + j: np.linspace(-0.6, 0.6, n)
+            0: np.linspace(mle_params[0] / 1.5, mle_params[0] * 1.5, n),
+            i: np.linspace(mle_params[i] / 1.5, mle_params[i] * 1.5, n),
+            i + j: np.linspace(mle_params[i+j] - 0.2, mle_params[i+j] + 0.2, n)
         }
-        return param_ranges.get(param_idx, np.linspace(-50, 50, n))
+        return param_ranges.get(param_idx, np.linspace(mle_params[param_idx] / 1.5, mle_params[param_idx] * 1.5, n))
 
-    def generate_free_params(self,param_idx):
+    def _generate_free_params(self,param_idx, fixed_param_values = None):
         """Efficient single-loop version of the parameter profiling process."""
-        i, j, k = self.len_exog  # Extract external indices
+        if fixed_param_values is None:
+            i, j, k = self.len_exog  # Extract external indices
 
-        # Predefine default values for free parameters
-        default_params = [self.location_guess if idx == 0 else
-                          self.scale_guess if idx == i else
-                          self.shape_guess if idx == i + j else 0
-                          for idx in range(self.nparams)]
-        free_params = default_params[:param_idx] + default_params[param_idx+1:]
-        return free_params  
+            # Predefine default values for free parameters
+            default_params = [self.location_guess if idx == 0 else
+                            self.scale_guess if idx == i else
+                            self.shape_guess if idx == i + j else 0
+                            for idx in range(self.nparams)]
+
+            free_params = default_params[:param_idx] + default_params[param_idx+1:]
+            return free_params  
+        else:
+            return np.concatenate((fixed_param_values[:param_idx],fixed_param_values[param_idx+1:]))
 
     def fit(self, start_params=None, optim_method='L-BFGS-B', fit_method ='MLE', **kwargs):
         """
@@ -315,21 +334,27 @@ class GEVLikelihood(GEV):
                 plot_data = self.endog
 
             return GEVFit(
-                optimize_result = self.result,
+                fitted_params = self.result.x,
                 endog=self.endog,
                 len_endog=self.len_endog,
                 exog = self.exog,
                 len_exog = self.len_exog,
                 trans=self.trans,
                 plot_data = plot_data,
-                gev_params = (fitted_loc,fitted_scale,fitted_shape)
+                gev_params = (fitted_loc,fitted_scale,fitted_shape),
+                log_likelihood = self.result.fun,
+                cov_matrix= self.result.hess_inv,
+                jacobian = self.result.jac,
+                CIs = None,
+                fit_method = 'MLE'
             )
         else:
             n=1000
+            mle_model = self.fit(start_params,optim_method,fit_method="MLE")
+            mle_params = mle_model.fitted_params
             all_profile_mles = np.empty((self.nparams,n))
             all_param_values = np.empty((self.nparams,n))
-            args = [(param_idx, n, optim_method) for param_idx in range(self.nparams)]
-
+            args = [(param_idx, n, optim_method,mle_params) for param_idx in range(self.nparams)]
             start_time = time.perf_counter()
             with ProcessPoolExecutor() as executor:
                 for param_idx, profile_mles, param_values in executor.map(self._optimize_profile_parallel, args):
@@ -340,16 +365,34 @@ class GEVLikelihood(GEV):
             execution_time = end_time - start_time
             print(f"Execution Time: {execution_time:.4f} seconds")
 
-            return all_param_values[0][np.argmin(all_profile_mles[0])]
+            fitted_params = np.array([all_param_values[i][np.argmin(all_profile_mles[i])] for i in range(self.nparams)])
+            fitted_loc = self.loc_link(self.exog['location'] @ fitted_params[:i]).reshape(-1,1)
+            fitted_scale = self.scale_link(self.exog['scale'] @ fitted_params[i:i+j]).reshape(-1,1)
+            fitted_shape = self.shape_link(self.exog['shape'] @ fitted_params[i+j:]).reshape(-1,1)
+            return GEVFit(
+                fitted_params = fitted_params,
+                endog=self.endog,
+                len_endog=self.len_endog,
+                exog = self.exog,
+                len_exog = self.len_exog,
+                trans=self.trans,
+                plot_data=None,
+                gev_params = (fitted_loc,fitted_scale,fitted_shape),
+                log_likelihood = mle_model.log_likelihood,
+                cov_matrix= mle_model.cov_matrix,
+                jacobian = mle_model.jacobian,
+                CIs = self._compute_CIs(all_param_values,all_profile_mles,fitted_params,0.95),
+                fit_method = 'Profile'
+            )
 
     #Made to be run in a parallel computing framework 
     def _optimize_profile_parallel(self,args):
-        param_idx,n,optim_method = args
+        param_idx,n,optim_method,mle_params = args
         profile_mles = np.empty(n)
         param_values = np.empty(n)
 
-        profile_params = self.generate_profile_params(param_idx=param_idx,n=n)
-        free_params = self.generate_free_params(param_idx=param_idx)
+        profile_params = self.generate_profile_params(param_idx=param_idx,n=n,mle_params=mle_params)
+        free_params = self._generate_free_params(param_idx=param_idx)
         for n_i, param_value in enumerate(profile_params):
                     nloglike_partial = partial(self.nloglike,forced_index=param_idx,forced_param_value=param_value)
                     result = minimize(nloglike_partial, free_params, method=optim_method)
@@ -357,23 +400,26 @@ class GEVLikelihood(GEV):
                     param_values[n_i] = param_value
         
         return param_idx, profile_mles, param_values
-    
-    def _future_method(self):
-        #for n in range(selvf.nparams):
-            #estims[n] = param_values[n][np.argmin(profile_mles[n])]
-            #threshold   = chi2.ppf(0.95, df=1)/2
-            #cutoff = profile_mles[0] - profile_mles[0][np.argmin(profile_mles[0])]
-            #indices = np.where(cutoff<=threshold)[0]
 
-            #lower_bound = param_values[0][indices[0]]  # First valid theta value
-            #upper_bound = param_values[0][indices[-1]]
-        return 0
+    def _compute_CIs(self, all_param_values, all_profile_mles, fitted_params, treshold):
+        CIs = np.empty((len(fitted_params),3))
+        for i in range(len(fitted_params)):
+            free_params = self._generate_free_params(param_idx = i,fixed_param_values=fitted_params)
+            p_value = 2*(self.nloglike(free_params=free_params,forced_index=i,forced_param_value=0.0001) - self.nloglike(free_params=fitted_params))
+            chi2_threshold   = chi2.ppf(treshold, df=1)/2
+            cutoff = all_profile_mles[i] - all_profile_mles[i][np.argmin(all_profile_mles[i])]
+            indices = np.where(cutoff<=chi2_threshold)[0]
+
+            lower_bound = all_param_values[i][indices[0]]  # First valid theta value
+            upper_bound = all_param_values[i][indices[-1]]
+            CIs[i][0],CIs[i][1],CIs[i][2] = (lower_bound,upper_bound,p_value)
+        return CIs
 
 
 class GEVFit():
-    def __init__(self, optimize_result, endog, len_endog, exog, len_exog, trans,plot_data,gev_params):
+    def __init__(self, fitted_params, endog, len_endog, exog, len_exog, trans,plot_data,gev_params,log_likelihood,cov_matrix,jacobian, CIs, fit_method):
             # Extract relevant attributes from optimize_result and give them meaningful names
-            self.fitted_params = optimize_result.x
+            self.fitted_params = fitted_params
             self.endog = endog
             self.len_endog = len_endog
             self.exog = exog
@@ -381,11 +427,12 @@ class GEVFit():
             self.trans = trans
             self.plot_data = plot_data
             self.gev_params = gev_params
-            self.log_likelihood = optimize_result.fun
-            self.cov_matrix = optimize_result.hess_inv
-            self.jacobian = optimize_result.jac
-            self.success = optimize_result.success
+            self.log_likelihood = log_likelihood
+            self.cov_matrix = cov_matrix
+            self.jacobian = jacobian
             self.nparams = self.fitted_params.size
+            self.CIs = CIs
+            self.fit_method = fit_method
 
     def AIC(self):
         return 2 * self.nparams + 2 * self.log_likelihood
@@ -412,7 +459,7 @@ class GEVFit():
         header = "Parameter  Estimate   SE     z     P>|z|  95% CI          Signif."
         line_length = len(header)
         separator = "-" * line_length
-        
+
         # Format the output string
         result_str = "\n"
         result_str += "=" * line_length + "\n"
@@ -423,7 +470,7 @@ class GEVFit():
         result_str += separator + "\n"
         result_str += header + "\n"
         result_str += separator + "\n"
-        
+
         for i in range(self.nparams):
             # Determine significance stars based on p-value
             if p_values[i] < 0.001:
@@ -435,16 +482,19 @@ class GEVFit():
             else:
                 signif = ''
             
-            # Calculate the 95% confidence interval
-            ci_lower = self.fitted_params[i] - 1.96 * se[i]
-            ci_upper = self.fitted_params[i] + 1.96 * se[i]
+            # Determine confidence intervals
+            if self.fit_method.lower() == 'mle':
+                ci_lower = self.fitted_params[i] - 1.96 * se[i]
+                ci_upper = self.fitted_params[i] + 1.96 * se[i]
+            else:
+                ci_lower, ci_upper = self.CIs[i][0], self.CIs[i][1]
             
             result_str += (f"{i+1:<10} {self.fitted_params[i]:<10.4f} {se[i]:<7.4f} {z_scores[i]:<6.2f} "
-                           f"{p_values[i]:<.4f}  ({ci_lower:.4f}, {ci_upper:.4f}) {signif}\n")
-        
+                        f"{p_values[i]:<.4f}  ({ci_lower:.4f}, {ci_upper:.4f}) {signif}\n")
+
         result_str += separator + "\n"
         result_str += "Notes: *** p<0.001, ** p<0.01, * p<0.05\n"
-        
+
         return result_str
 
     def _compute_confidence_interval(self, params, cov_matrix, compute_z_p, z_p, confidence=0.95):
@@ -897,7 +947,7 @@ if __name__ == "__main__":
     EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
     n = len(EOBS["prmax"].values.reshape(-1,1))
     #tempanomalyMean
-    exog = {"location" : EOBS[["tempanomalyMean"]]}
+    exog = {"location" : EOBS[["tempanomalyMean"]], "scale" :  EOBS[["tempanomalyMean"]]}
     #model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
@@ -908,6 +958,10 @@ if __name__ == "__main__":
 
     a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit(fit_method="i")
     print(a1)
+    a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit(fit_method="mle")
+    print(a2)
+    a3 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog={}).fit(fit_method="mle")
+    print(a3)
     #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
 
