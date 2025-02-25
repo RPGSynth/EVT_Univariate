@@ -37,23 +37,33 @@ class GEV:
     """
     
     @staticmethod
-    def identity(x):
+    def identity(x: np.ndarray) -> np.ndarray:
         return x
 
     @staticmethod
-    def exp_link(x):
+    def exp_link(x: np.ndarray) -> np.ndarray:
         return np.exp(x)
 
-    def __init__(self, endog, exog=None, loc_link=None, scale_link=None, shape_link=None, **kwargs):
+    def __init__(
+        self, 
+        endog: Any, 
+        exog: Any = None,
+        loc_link: Optional[Callable] = None,
+        scale_link: Optional[Callable] = None,
+        shape_link: Optional[Callable] = None,
+        **kwargs: Any):
         """
         Initializes the GEV model with specified parameters.
         
         Parameters
         ----------
         endog : array-like
-            Endogenous variable.
-        exog : dict of array-like, optional
-            Dictionary where keys are 'shape', 'scale', and 'location', specifying exogenous variables for each parameter.
+            Endogenous variable. Can be a list, NumPy array, Pandas Series, or any array-like object.
+        exog : array-like or dict, optional
+            Exogenous variables for parameters. Can be:
+            - A list, NumPy array, or Pandas DataFrame to be used for all parameters
+            - A dictionary with keys 'shape', 'scale', and 'location', where values can be 
+              lists, NumPy arrays, or Pandas Series.
         loc_link : callable, optional
             Link function for the location parameter. Defaults to identity.
         scale_link : callable, optional
@@ -62,110 +72,218 @@ class GEV:
             Link function for the shape parameter. Defaults to identity.
         kwargs : dict
             Additional keyword arguments.
+            
+        Raises
+        ------
+        ValueError
+            If endogenous data is empty or invalid, or if exogenous data shapes are inconsistent.
+        TypeError
+            If link functions are not callable or if inputs cannot be converted to appropriate types.
         """
-        if endog is None or len(endog) == 0:
+
+        #----------Deal with Endog input-----------------
+        # Exceptions
+
+        ## 1 : Endog has a length and elements.
+        if endog is None or (hasattr(endog, '__len__') and len(endog) == 0):
             raise ValueError("The `endog` parameter must not be None or empty. Please provide valid endogenous data.")
+
         
-        # Store attributes
-        self.len_endog = len(endog)
-        self.result = None
-        self.fitted = False
-        self.scale_guess = np.sqrt(6 * np.var(endog)) / np.pi
-        self.location_guess = np.mean(endog) - 0.57722 * (np.sqrt(6 * np.var(endog)) / np.pi)
-        self.shape_guess = 0.1
+        ## 2 : Endog is a dataframe, series or other array like data and can be converted to numpy.
+        try:
+            # Handle pandas Series/DataFrame
+            if isinstance(endog, (pd.Series, pd.DataFrame)):
+                self.endog = endog.values
+            # We assume it must be list
+            else:
+                self.endog = np.asarray(endog)
+                
+            # Ensure it's a float array and of shape (x,1)
+            self.endog = self.endog.astype(float).reshape(-1, 1)
+        except Exception as e:
+            raise TypeError(f"Could not convert endogenous data to a numeric array: {str(e)}")
+
+
+        ## 3 : The elements of endog are not Nan.
+        if np.isnan(self.endog).any():
+            raise ValueError("The `endog` parameter contains NaN values.")
+        
+
+        ## 4 : Link functions are callable if they are defined. 
+        for name, func in [('loc_link', loc_link), ('scale_link', scale_link), ('shape_link', shape_link)]:
+            if func is not None and not callable(func):
+                raise TypeError(f"The `{name}` parameter must be callable or None.")
+
+
+        # ------------------------
+        #1 Setting class attributes
+
+        ## 1 : Link functions attributes
         self.loc_link = loc_link or self.identity
         self.scale_link = scale_link or self.identity
         self.shape_link = shape_link or self.identity
+        
+
+        ## 2 : Data and fit attributes
+        self.endog = endog
+        self.len_endog = len(self.endog)
+        self.result = None
+        self.scale_guess = np.sqrt(6 * np.var(endog)) / np.pi
+        self.location_guess = np.mean(endog) - 0.57722 * (np.sqrt(6 * np.var(endog)) / np.pi)
+        self.shape_guess = 0.1
+
+        ##3 : Internal attributes
         self._forced_param_index = -1
         self._forced_param_value = 0
 
-        # Handle data
-        self._process_data(endog, exog, **kwargs)
+        #---------------------------
+        # Handle exog data
+        self._process_exog(exog, **kwargs)
 
-    def _process_data(self, endog, exog=None, **kwargs):
+    def _process_exog(self, 
+        exog: Any = None
+        ) -> Dict[str, np.ndarray]:
         """
-        Processes and validates the endogenous and exogenous data.
+        Processes and validates the exogenous data.
 
         Parameters
         ----------
-        endog : array-like
-            Endogenous variable.
-        exog : dict or array-like, optional
-            Exogenous variables for parameters. Can be a single array (applied to all) or a dict with keys
-            'shape', 'scale', and 'location'.
-        kwargs : dict
-            Additional arguments for data handling.
-            
+        exog : any, optional
+            Exogenous variables for parameters. Can be:
+            - None: Use default exogenous variables (a single column of ones) for all parameters.
+            - dict: A dictionary with keys 'shape', 'scale', 'location' mapping to exogenous variables for each parameter.
+                Each value can be:
+                - None: Use the default (a column of ones).
+                - array-like: An array-like object with shape (n_samples,) or (n_samples, n_features).
+            - array-like: An array-like object with shape (n_samples,) or (n_samples, n_features) to be used for all parameters.
         Returns
         -------
         dict
-            Processed data for internal use or external reference.
+            Processed data dictionary with 'shape', 'scale', and 'location' keys.
+            
+        Raises
+        ------
+        ValueError
+            If exogenous data has inconsistent shapes or invalid structure.
+        TypeError
+            If exogenous data cannot be converted to numeric arrays.
         """
+        param_names = ['shape', 'scale', 'location']
+        self.exog = {}
+
+
+        # Case 1: No exogenous variables provided (use default ones arrays)
         if exog is None:
-            # Initialize exog as a dictionary with ones as default values for each parameter
-            self.exog = {
-                'shape': np.ones((self.len_endog, 1)),
-                'scale': np.ones((self.len_endog, 1)),
-                'location': np.ones((self.len_endog, 1))
-            }
-        elif isinstance(exog, np.ndarray):
-            if exog.shape[0] != self.len_endog:
-                raise ValueError(
-                    f"The length of the provided exog array ({exog.shape[0]}) must match the length of `endog` ({self.len_endog})."
-                )
-            if len(exog.shape) == 1:
-                exog_augmented = np.concatenate([np.ones((self.len_endog, 1)), exog.reshape(-1,1)], axis=1)
-            else:
-                # Use the same `exog` array for all three parameters
-                exog_augmented = np.concatenate([np.ones((self.len_endog, 1)), exog], axis=1)
-            self.exog = {
-                'shape': exog_augmented,
-                'scale': exog_augmented,
-                'location': exog_augmented
-            }
+            for param in param_names:
+                self.exog[param] = np.ones((self.len_endog, 1))
+
+        # Case 2: Dictionary of exogenous variables
         elif isinstance(exog, dict):
-            # Initialize the exog dictionary by iterating over the keys
-            self.exog = {}
-            for key in ['shape', 'scale', 'location']:
-                value = exog.get(key)
-                if value is None:
-                    self.exog[key] = np.ones((self.len_endog, 1))
+            # Check for invalid keys
+            invalid_keys = [key for key in exog.keys() if key not in param_names]
+            if invalid_keys:
+                raise ValueError(f"Invalid keys in exog dictionary: {invalid_keys}. "
+                                f"Expected keys are: {param_names}")
+            
+            for param in param_names:
+                param_exog = exog.get(param)
+                
+                if param_exog is None:
+                    # Use default ones array
+                    self.exog[param] = np.ones((self.len_endog, 1))
                 else:
-                    value_array = np.asarray(value)
-                    if value_array.shape[0] != self.len_endog:
+                    # Convert to numpy array supporting various input types
+                    try:
+                        if isinstance(param_exog, (pd.Series, pd.DataFrame)):
+                            param_exog_array = param_exog.values
+                        else:
+                            param_exog_array = np.asarray(param_exog)
+                            
+                        param_exog_array = param_exog_array.astype(float)
+                    except Exception as e:
+                        raise TypeError(f"Could not convert exog['{param}'] to a numeric array: {str(e)}")
+                    
+                    # Validate shape
+                    if param_exog_array.shape[0] != self.len_endog:
                         raise ValueError(
-                            f"The number of rows in exog['{key}'] ({value_array.shape[0]}) "
-                            f"must match the number of rows in `endog` ({self.len_endog})."
+                            f"The number of rows in exog['{param}'] ({param_exog_array.shape[0]}) "
+                            f"must match the number of samples in endog ({self.len_endog})."
                         )
-                    if len(value_array.shape) == 1:
-                        self.exog[key] = np.concatenate([np.ones((self.len_endog, 1)), value_array.reshape(-1, 1)], axis=1)
+                    
+                    # Add constant column
+                    if len(param_exog_array.shape) == 1:
+                        self.exog[param] = np.concatenate([np.ones((self.len_endog, 1)), param_exog_array.reshape(-1, 1)], axis=1)
                     else:
-                        self.exog[key] = np.concatenate([np.ones((self.len_endog, 1)), value_array], axis=1)
+                        self.exog[param] = np.concatenate([np.ones((self.len_endog, 1)), param_exog_array], axis=1)
+                        
         else:
-            raise ValueError("`exog` must be either a dictionary (default), or a NumPy array of shape (n,>=1).")
+            # Convert to numpy array supporting various input types
+            try:
+                # Handle pandas DataFrame
+                if isinstance(exog, pd.DataFrame):
+                    exog_array = exog.values
+                elif isinstance(exog, pd.Series):
+                    exog_array = exog.values.reshape(-1, 1)
+                else:
+                    exog_array = np.asarray(exog)
+
+                # Ensure it's a float array
+                exog_array = exog_array.astype(float)
+            except Exception as e:
+                raise TypeError(f"Could not convert exog to a numeric array: {str(e)}")
+
+            # Validate shape
+            if exog_array.shape[0] != self.len_endog:
+                raise ValueError(
+                    f"The length of the provided exog array ({exog_array.shape[0]}) "
+                    f"must match the length of `endog` ({self.len_endog})."
+                )
+
+            if len(exog_array.shape) == 1:
+                exog_augmented = np.concatenate([np.ones((self.len_endog, 1)), exog_array.reshape(-1,1)], axis=1)
+            else:
+                exog_augmented = np.concatenate([np.ones((self.len_endog, 1)), exog_array], axis=1)
+            
+            # Use the same exog array for all parameters
+            for param in param_names:
+                self.exog[param] = exog_augmented
         
         if all(np.array_equal(self.exog[key], np.ones((self.len_endog, 1))) for key in ['shape', 'scale', 'location']):
             self.trans = False
         else:
             self.trans = True
 
-        self.endog = np.asarray(endog).reshape(-1, 1)
         self.len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1])
-        self.nparams = self.len_exog[0]+self.len_exog[1]+self.len_exog[2]
+        self.nparams = sum(self.len_exog)
 
     def fit(self):
         """
         Fit a model to data.
+        
+        Returns
+        -------
+        Any
+            Fitted model result.
+            
+        Raises
+        ------
+        NotImplementedError
+            This method must be implemented by subclasses.
         """
-        raise NotImplementedError
+        raise NotImplementedError("Subclasses must implement this method.")
 
-    def predict(self, params, exog=None, *args, **kwargs):
+    def generate(self):
         """
-        Predict fitted values after model fitting.
+        Generate GEV values after model fitting.
 
         This is a placeholder intended to be overwritten by individual models.
         """
-        raise NotImplementedError
+        raise NotImplementedError("Subclasses must implement this method.")
+
+    def return_level(self):
+         raise NotImplementedError("Subclasses must implement this method.")
+
+
 
 class GEVLikelihood(GEV):
     def __init__(self, endog, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, exog={'shape': None, 'scale': None, 'location': None}, **kwargs):
@@ -467,8 +585,6 @@ class GEVFit():
     
     def __str__(self): 
         # Calculate fitted values, SE, z-scores, p-values, AIC, and BIC
-        se = self.SE()
-        z_scores = self.fitted_params / se
         aic = self.AIC()
         bic = self.BIC()
 
@@ -981,8 +1097,10 @@ if __name__ == "__main__":
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
     EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
-    n = len(EOBS["prmax"].values.reshape(-1,1))
-    #tempanomalyMean
+    #n = len(EOBS["prmax"].values.reshape(-1,1))
+    #
+    # Dummy endog variable (10 samples)
+    
     exog = {"location" : EOBS[["tempanomalyMean"]], "scale" :  EOBS[["tempanomalyMean"]]}
     #model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
@@ -992,8 +1110,12 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit(fit_method="profile")
-    print(a1)
+    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
+    print(a1.fit(fit_method='profile'))
+    #a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1))
+    #print(a1.len_exog)
+
+
     #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
 
