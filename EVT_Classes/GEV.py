@@ -19,8 +19,9 @@ from joblib import Parallel, delayed
 from functools import partial
 import time
 from typing import Dict, Union, Optional, Callable, Any, List, Tuple
+from abc import ABC, abstractmethod
 
-class GEV:
+class GEV(ABC):
     """
     A statistical model supporting GEV models.
     
@@ -46,14 +47,92 @@ class GEV:
 
     def __init__(
         self, 
-        endog: Any, 
-        exog: Any = None,
         loc_link: Optional[Callable] = None,
         scale_link: Optional[Callable] = None,
-        shape_link: Optional[Callable] = None,
-        **kwargs: Any):
+        shape_link: Optional[Callable] = None):
         """
         Initializes the GEV model with specified parameters.
+        
+        Parameters
+        ----------
+        To be remade
+        """
+        self.loc_link = loc_link
+        self.scale_link = scale_link
+        self.shape_link = shape_link
+
+
+    def nloglike(self, free_params, forced_index=-1,forced_param_value=0):
+        """
+        Computes the negative log-likelihood of the GEV model.
+        """
+
+        # Extract the number of covariates for each parameter
+        i, j, _ = self.len_exog
+        params = np.ones(self.nparams)
+        free_index = 0
+
+        for k in range(self.nparams):  # Total number of parameters
+            if k == forced_index:
+                params[k] = forced_param_value  # Use fixed parameter value
+            else:
+                params[k] = free_params[free_index] # Use optimized parameter
+                free_index += 1
+        
+        # Compute location, scale, and shape parameters
+        location = self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)))
+        scale = self.scale_link(np.dot(self.exog['scale'], params[i:i+j].reshape(-1,1)))
+        shape = self.shape_link(np.dot(self.exog['shape'], params[i+j:].reshape(-1,1)))
+        # GEV transformation
+        normalized_data = (self.endog - location) / scale
+        if np.allclose(shape, 0):  # Treat shape = 0 separately
+            log_likelihood = (
+                np.sum(np.log(scale))
+                + np.sum(normalized_data)
+                + np.sum(np.exp(-normalized_data))
+            )
+        else:
+            # Standard GEV transformation
+            transformed_data = 1 + shape * normalized_data
+
+            # Return a large penalty for invalid parameter values
+            if np.any(transformed_data <= 0) or np.any(scale <= 0):
+                return 1e6
+
+            log_likelihood = (
+                np.sum(np.log(scale))
+                + np.sum(transformed_data ** (-1 / shape))
+                + np.sum(np.log(transformed_data) * (1 + 1 / shape))
+            )
+
+        return log_likelihood 
+
+    def loglike(self,params):
+        return -(self.nloglike(params))
+    
+    @abstractmethod
+    def fit(self):
+        """
+        Fit a model to data.
+        
+        Returns
+        -------
+        Any
+            Fitted model result.
+            
+        Raises
+        ------
+        NotImplementedError
+            This method must be implemented by subclasses.
+        """
+        raise NotImplementedError("Subclasses must implement this method.")
+
+
+
+class GEVSample(GEV):
+    def __init__(self, endog, exog={'shape': None, 'scale': None, 'location': None}, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, **kwargs):
+        """
+        Initializes the GEV model for a data sample with specified parameters.
         
         Parameters
         ----------
@@ -80,6 +159,9 @@ class GEV:
         TypeError
             If link functions are not callable or if inputs cannot be converted to appropriate types.
         """
+        #----------Initiate common parameters-----------
+
+        super().__init__(loc_link=loc_link,scale_link=scale_link,shape_link=shape_link)
 
         #----------Deal with Endog input-----------------
         # Exceptions
@@ -110,7 +192,7 @@ class GEV:
         
 
         ## 4 : Link functions are callable if they are defined. 
-        for name, func in [('loc_link', loc_link), ('scale_link', scale_link), ('shape_link', shape_link)]:
+        for name, func in [('loc_link', self.loc_link), ('scale_link', self.scale_link), ('shape_link', self.shape_link)]:
             if func is not None and not callable(func):
                 raise TypeError(f"The `{name}` parameter must be callable or None.")
 
@@ -119,13 +201,12 @@ class GEV:
         #1 Setting class attributes
 
         ## 1 : Link functions attributes
-        self.loc_link = loc_link or self.identity
-        self.scale_link = scale_link or self.identity
-        self.shape_link = shape_link or self.identity
+        self.loc_link = self.loc_link or self.identity
+        self.scale_link = self.scale_link or self.identity
+        self.shape_link = self.shape_link or self.identity
         
 
         ## 2 : Data and fit attributes
-        self.endog = endog
         self.len_endog = len(self.endog)
         self.result = None
         self.scale_guess = np.sqrt(6 * np.var(endog)) / np.pi
@@ -215,7 +296,8 @@ class GEV:
                         self.exog[param] = np.concatenate([np.ones((self.len_endog, 1)), param_exog_array.reshape(-1, 1)], axis=1)
                     else:
                         self.exog[param] = np.concatenate([np.ones((self.len_endog, 1)), param_exog_array], axis=1)
-                        
+
+        # Case 3 : Array like object           
         else:
             # Convert to numpy array supporting various input types
             try:
@@ -256,48 +338,6 @@ class GEV:
         self.len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1])
         self.nparams = sum(self.len_exog)
 
-    def fit(self):
-        """
-        Fit a model to data.
-        
-        Returns
-        -------
-        Any
-            Fitted model result.
-            
-        Raises
-        ------
-        NotImplementedError
-            This method must be implemented by subclasses.
-        """
-        raise NotImplementedError("Subclasses must implement this method.")
-
-    def generate(self):
-        """
-        Generate GEV values after model fitting.
-
-        This is a placeholder intended to be overwritten by individual models.
-        """
-        raise NotImplementedError("Subclasses must implement this method.")
-
-    def return_level(self):
-         raise NotImplementedError("Subclasses must implement this method.")
-
-
-
-class GEVLikelihood(GEV):
-    def __init__(self, endog, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, exog={'shape': None, 'scale': None, 'location': None}, **kwargs):
-        """
-        Initializes the GEVLikelihood model with given parameters.
-        """
-        super().__init__(endog=endog, exog=exog, loc_link=loc_link, scale_link=scale_link, shape_link=shape_link, **kwargs)
-
-    def loglike(self, params):
-        """
-        Computes the log-likelihood of the model.
-        """
-        return -(self.nloglike(params))
-
     #Careful works on 1D par
     def hess(self, params=None):
         """
@@ -328,61 +368,6 @@ class GEVLikelihood(GEV):
             return self.result.jac
         else:
             raise ValueError("Model is not fitted. Cannot compute the score at optimal parameters.")
-
-    def nloglike(self, free_params, forced_index=-1,forced_param_value=0):
-        """
-        Computes the negative log-likelihood of the GEV model.
-        """
-
-        # Extract the number of covariates for each parameter
-        i, j, _ = self.len_exog
-        params = np.ones(self.nparams)
-        free_index = 0
-
-        for k in range(self.nparams):  # Total number of parameters
-            if k == forced_index:
-                params[k] = forced_param_value  # Use fixed parameter value
-            else:
-                params[k] = free_params[free_index] # Use optimized parameter
-                free_index += 1
-        
-        # Compute location, scale, and shape parameters
-        location = self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)))
-        scale = self.scale_link(np.dot(self.exog['scale'], params[i:i+j].reshape(-1,1)))
-        shape = self.shape_link(np.dot(self.exog['shape'], params[i+j:].reshape(-1,1)))
-        # GEV transformation
-        normalized_data = (self.endog - location) / scale
-        if np.allclose(shape, 0):  # Treat shape = 0 separately
-            log_likelihood = (
-                np.sum(np.log(scale))
-                + np.sum(normalized_data)
-                + np.sum(np.exp(-normalized_data))
-            )
-        else:
-            # Standard GEV transformation
-            transformed_data = 1 + shape * normalized_data
-
-            # Return a large penalty for invalid parameter values
-            if np.any(transformed_data <= 0) or np.any(scale <= 0):
-                return 1e6
-
-            log_likelihood = (
-                np.sum(np.log(scale))
-                + np.sum(transformed_data ** (-1 / shape))
-                + np.sum(np.log(transformed_data) * (1 + 1 / shape))
-            )
-
-        return log_likelihood 
-    
-    def loglike(self,params):
-        return -(self.nloglike(params))
-
-    def profile_nloglike(self):
-        return 0
-
-    def profile_loglike(self):
-        return -(self.profile_nloglike())
-    
 
     def _generate_profile_params(self, param_idx, n,mle_params):
         """Generate profile parameter values based on param index rules."""
@@ -427,94 +412,88 @@ class GEVLikelihood(GEV):
         
         return param_idx, profile_mles, param_values
 
-    def fit(self, start_params=None, optim_method='L-BFGS-B', fit_method ='MLE', **kwargs):
+    def fit(self, start_params=None, optim_method='L-BFGS-B', fit_method='MLE', **kwargs):
         """
-        Fits the model using maximum likelihood estimation.
-
-        Parameters
-        ----------
-        start_params : array_like, optional
-            Initial guess of the solution for the loglikelihood maximization.
-            The default is an array of zeros.
-        method : str, optional
-            The `method` determines which solver from `scipy.optimize`
-            is used, and it can be chosen from among the following strings:
-
-            - 'newton' for Newton-Raphson, 'nm' for Nelder-Mead
-            - 'bfgs' for Broyden-Fletcher-Goldfarb-Shanno (BFGS)
-            - 'lbfgs' for limited-memory BFGS with optional box constraints
-            - 'powell' for modified Powell's method
-            - 'cg' for conjugate gradient
-            - 'ncg' for Newton-conjugate gradient
-            - 'basinhopping' for global basin-hopping solver
-            - 'minimize' for generic wrapper of scipy minimize (BFGS by default)
+        Fits the model using the specified method (MLE or Profile).
         """
-        i,j,k = self.len_exog
         if fit_method.lower() == 'mle':
-            if start_params is None:
-                free_params = np.array(
-                [self.location_guess] +
-                ([0] * (i-1)) +
-                [self.scale_guess] +
-                ([0] * (j-1)) +
-                [self.shape_guess] +
-                ([0] * (k-1))
-                )
-
-            self.result = minimize(self.nloglike, free_params, method=optim_method, **kwargs)
-
-            fitted_loc = self.loc_link(self.exog['location'] @ self.result.x[:i]).reshape(-1,1)
-            fitted_scale = self.scale_link(self.exog['scale'] @ self.result.x[i:i+j]).reshape(-1,1)
-            fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[i+j:]).reshape(-1,1)
-
-            return GEVFit(
-                fitted_params = self.result.x,
-                endog=self.endog,
-                len_endog=self.len_endog,
-                exog = self.exog,
-                len_exog = self.len_exog,
-                trans=self.trans,
-                gev_params = (fitted_loc,fitted_scale,fitted_shape),
-                log_likelihood = self.result.fun,
-                cov_matrix= self.result.hess_inv,
-                jacobian = self.result.jac,
-                CIs = self._compute_CIs_mle(self.result.hess_inv.todense(),self.result.x,0.95),
-                fit_method = 'MLE'
-            )
+            return self.fit_mle(start_params, optim_method, **kwargs)
+        elif fit_method.lower() == 'profile':
+            return self.fit_profile(start_params, optim_method, **kwargs)
         else:
-            n=1000
-            mle_model = self.fit(start_params,optim_method,fit_method="MLE")
-            fitted_params = mle_model.fitted_params
-            all_profile_mles = np.empty((self.nparams,n))
-            all_param_values = np.empty((self.nparams,n))
-            args = [(param_idx, n, optim_method,fitted_params) for param_idx in range(self.nparams)]
-            start_time = time.perf_counter()
-            with ProcessPoolExecutor() as executor:
-                for param_idx, profile_mles, param_values in executor.map(self._optimize_profile_parallel, args):
-                    all_profile_mles[param_idx] = profile_mles
-                    all_param_values[param_idx] = param_values
+            raise ValueError("Unsupported fit method. Choose 'MLE' or 'Profile'.")
 
-            end_time = time.perf_counter()
-            execution_time = end_time - start_time
-            print(f"Execution Time: {execution_time:.4f} seconds")
-
-            fitted_loc = self.loc_link(self.exog['location'] @ fitted_params[:i]).reshape(-1,1)
-            fitted_scale = self.scale_link(self.exog['scale'] @ fitted_params[i:i+j]).reshape(-1,1)
-            fitted_shape = self.shape_link(self.exog['shape'] @ fitted_params[i+j:]).reshape(-1,1)
-            return GEVFit(
-                fitted_params = fitted_params,
-                endog=self.endog,
-                len_endog=self.len_endog,
-                exog = self.exog,
-                len_exog = self.len_exog,
-                trans=self.trans,
-                gev_params = (fitted_loc,fitted_scale,fitted_shape),
-                log_likelihood = mle_model.log_likelihood,
-                cov_matrix= mle_model.cov_matrix,
-                jacobian = mle_model.jacobian,
-                CIs = self._compute_CIs_profile(all_param_values,all_profile_mles,fitted_params,0.95),
-                fit_method = 'Profile'
+    def fit_mle(self, start_params, optim_method, **kwargs):
+        """Performs Maximum Likelihood Estimation (MLE)."""
+        i, j, k = self.len_exog
+        
+        if start_params is None:
+            start_params = np.array(
+                [self.location_guess] + ([0] * (i-1)) +
+                [self.scale_guess] + ([0] * (j-1)) +
+                [self.shape_guess] + ([0] * (k-1))
             )
+        
+        self.result = minimize(self.nloglike, start_params, method=optim_method, **kwargs)
+
+        fitted_loc = self.loc_link(self.exog['location'] @ self.result.x[:i]).reshape(-1, 1)
+        fitted_scale = self.scale_link(self.exog['scale'] @ self.result.x[i:i+j]).reshape(-1, 1)
+        fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[i+j:]).reshape(-1, 1)
+
+        return GEVFit(
+            fitted_params=self.result.x,
+            endog=self.endog,
+            len_endog=self.len_endog,
+            exog=self.exog,
+            len_exog=self.len_exog,
+            trans=self.trans,
+            gev_params=(fitted_loc, fitted_scale, fitted_shape),
+            log_likelihood=self.result.fun,
+            cov_matrix=self.result.hess_inv,
+            jacobian=self.result.jac,
+            CIs=self._compute_CIs_mle(self.result.hess_inv.todense(), self.result.x, 0.95),
+            fit_method='MLE'
+        )
+
+    def fit_profile(self, start_params, optim_method, **kwargs):
+        """Performs Profile Likelihood Estimation."""
+        n = 1000
+        mle_model = self.fit(start_params, optim_method, fit_method='MLE')
+        fitted_params = mle_model.fitted_params
+        
+        all_profile_mles = np.empty((self.nparams, n))
+        all_param_values = np.empty((self.nparams, n))
+        args = [(param_idx, n, optim_method, fitted_params) for param_idx in range(self.nparams)]
+        
+        start_time = time.perf_counter()
+        with ProcessPoolExecutor() as executor:
+            for param_idx, profile_mles, param_values in executor.map(self._optimize_profile_parallel, args):
+                all_profile_mles[param_idx] = profile_mles
+                all_param_values[param_idx] = param_values
+        
+        end_time = time.perf_counter()
+        print(f"Execution Time: {end_time - start_time:.4f} seconds")
+
+        i, j, k = self.len_exog
+        fitted_loc = self.loc_link(self.exog['location'] @ fitted_params[:i]).reshape(-1, 1)
+        fitted_scale = self.scale_link(self.exog['scale'] @ fitted_params[i:i+j]).reshape(-1, 1)
+        fitted_shape = self.shape_link(self.exog['shape'] @ fitted_params[i+j:]).reshape(-1, 1)
+        
+        return GEVFit(
+            fitted_params=fitted_params,
+            endog=self.endog,
+            len_endog=self.len_endog,
+            exog=self.exog,
+            len_exog=self.len_exog,
+            trans=self.trans,
+            gev_params=(fitted_loc, fitted_scale, fitted_shape),
+            log_likelihood=mle_model.log_likelihood,
+            cov_matrix=mle_model.cov_matrix,
+            jacobian=mle_model.jacobian,
+            CIs=self._compute_CIs_profile(all_param_values, all_profile_mles, fitted_params, 0.95),
+            fit_method='Profile'
+        )
+
 
     def _compute_CIs_mle(self,cov_matrix,fitted_params,treshold):
         CIs = np.empty((len(fitted_params),4))
@@ -981,10 +960,10 @@ class GEV_WWA(GEV):
 class GEV_WWA_Likelihood(GEV_WWA):
     def __init__(self, endog, loc_link=GEV.exp_link, scale_link=GEV.exp_link, shape_link=GEV.identity, exog={'shape': None, 'scale': None, 'location': None}, **kwargs):
         """
-        Initializes the GEVLikelihood model with given parameters.
+        Initializes the GEVSample model with given parameters.
         """
         super().__init__(endog=endog, exog=exog, loc_link=loc_link, scale_link=scale_link, shape_link=shape_link, **kwargs)
-        model_0 = GEVLikelihood(endog=self.endog,exog={}).fit()
+        model_0 = GEVSample(endog=self.endog,exog={}).fit()
         self.mu_0 = model_0.gev_params[0][0].item()
         self.sigma_0 = model_0.gev_params[1][0].item()
         
@@ -1101,8 +1080,8 @@ if __name__ == "__main__":
     #
     # Dummy endog variable (10 samples)
     
-    exog = {"location" : EOBS[["tempanomalyMean"]], "scale" :  EOBS[["tempanomalyMean"]]}
-    #model = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
+    exog = {"location" : EOBS[["tempanomalyMean","random_value"]], "scale" :  EOBS[["tempanomalyMean","random_value"]]}
+    #model = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
     #gev_result_1.data_plot(EOBS["year"].values)
@@ -1110,13 +1089,13 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
+    a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     print(a1.fit(fit_method='profile'))
-    #a1 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1))
+    #a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1))
     #print(a1.len_exog)
 
 
-    #a2 = GEVLikelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
+    #a2 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #a1.data_plot(time=EOBS["year"])
 
     #e = a1.return_level(return_period=5,ref_year=74)
