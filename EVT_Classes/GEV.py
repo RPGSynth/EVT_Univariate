@@ -128,7 +128,7 @@ class GEV(ABC):
         raise NotImplementedError("Subclasses must implement this method.")
 
     @abstractmethod
-    def return_levels(self):
+    def return_level(self):
         pass
 
 class GEVSample(GEV):
@@ -523,122 +523,26 @@ class GEVSample(GEV):
             CIs[i][0],CIs[i][1],CIs[i][2],CIs[i][3] = (lower_bound,upper_bound,p_value,deviance)
         return CIs
 
-    def _compute_confidence_interval(self, params, cov_matrix, compute_z_p, z_p, confidence=0.95):
+    def return_level(self, gevFit, T=None, t=None, confidence=0.95):
         """
-        Computes the confidence interval using the delta method.
+        Returns an object that can be used to compute return levels lazily.
 
         Parameters:
-        - params: ndarray, model parameters
-        - compute_z_p: function, function to compute z_p
-        - cov_matrix: ndarray, covariance matrix
-        - z_p: ndarray, point estimate
-        - confidence: float, confidence level (default: 0.95)
+        - gevFit: The fitted GEV model.
+        - T: A list/array of return periods specified by the user.
+        - t: A list/array of time steps specified by the user.
+        - confidence: Confidence level for return level estimation.
 
         Returns:
-        - z_p[0]: float, point estimate
-        - (ci_lower, ci_upper): tuple, confidence interval
+        - A `GEVReturnLevel` object that can compute return levels on demand.
         """
-        eps = np.sqrt(np.finfo(float).eps)
-        gradient = approx_fprime(params.flatten(), compute_z_p, eps).flatten()
+        return GEVReturnLevel(
+            gevFit=gevFit,
+            t=t,
+            T=T,
+            confidence=confidence
 
-        # Estimate standard error using the delta method
-        variance = gradient @ cov_matrix @ gradient.T
-        std_error = np.sqrt(variance)
-
-        # Compute confidence interval
-        alpha = 1 - confidence
-        z_crit = norm.ppf(1 - alpha / 2)
-        ci_lower = z_p - z_crit * std_error
-        ci_upper = z_p + z_crit * std_error
-
-        return z_p[0], (ci_lower[0], ci_upper[0])
-
-    def return_level(self, gevFit, return_period, confidence=0.95, ref_year=None):
-        """
-        Computes the return level of the Generalized Extreme Value (GEV) distribution for a given return period T.
-        If method is set to "delta", the confidence interval is estimated using the delta method.
-
-        Args:
-            T (float): Return period.
-            shape (float): Shape parameter (ξ) of the GEV distribution.
-            location (float): Location parameter (μ) of the GEV distribution.
-            scale (float): Scale parameter (σ) of the GEV distribution.
-            cov_matrix (np.ndarray, optional): Covariance matrix of the parameter estimates. Required for the delta method.
-            method (str, optional): Method for confidence interval estimation. Defaults to "delta".
-            confidence (float, optional): Confidence level for the interval. Defaults to 0.95.
-
-        Returns:
-            tuple: Return level estimate and confidence interval (lower, upper).
-        """
-        if return_period <= 1:
-            raise ValueError("Return period must be greater than 1.")
-        
-        if not gevFit.trans:
-            if ref_year is not None:
-                warnings.warn(
-                    "Reference years are not required in a stationary model. Each year has the same return level for a given return period.",
-                    UserWarning
-                )
-            loc, scale, shape = gevFit.gev_params[0][0], gevFit.gev_params[1][0], gevFit.gev_params[2][0]
-        else:
-            if ref_year is None:
-                raise ValueError(
-                    "A reference year must be provided in a non-stationary model since return levels vary over time for a given return period."
-                )
-            elif ref_year >= self.len_endog:
-                raise ValueError(
-                    "You can not get the future return levels but only present or past return levels."
-                )
-            loc, scale, shape = gevFit.gev_params[0][ref_year], gevFit.gev_params[1][ref_year], gevFit.gev_params[2][ref_year]
-
-        
-         # Compute the return level (Coles, 2001)
-        y_p = -np.log(1 - 1/return_period)
-        if shape == 0 or np.isclose(1/return_period, 0):
-            z_p = loc - scale * np.log(y_p)
-        else:
-            z_p = loc - (scale / shape) * (1 - y_p**(-shape))
-
-        if not self.trans:
-            def compute_z_p(params):
-                loc, scale, shape = params
-                y_p = -np.log(1 - 1/return_period)
-                if shape == 0 or np.isclose(1/return_period, 0):
-                    return loc - scale * np.log(y_p)
-                else:
-                    return loc - (scale / shape) * (1 - y_p**(-shape))
-
-            params = np.array([loc, scale, shape])
-
-        else:
-            i, j, k = self.len_exog
-            def compute_z_p(params):
-                loc = np.dot(self.exog['location'][ref_year][0:i],params[0:i])
-                scale = np.dot(self.exog['scale'][ref_year][0:j],params[i:i+j])
-                shape = np.dot(self.exog['shape'][ref_year][0:k],params[i+j:])
-                y_p = -np.log(1 - 1/return_period)
-                if shape == 0 or np.isclose(1/return_period, 0):
-                    return loc - scale * np.log(y_p)
-                else:
-                    return loc - (scale / shape) * (1 - y_p**(-shape))
-
-            params = gevFit.fitted_params
-            
-        return(self._compute_confidence_interval(params=params,cov_matrix=gevFit.cov_matrix.todense(),compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
-
-    def return_levels(self, gevFit, confidence=0.95, N=30):
-        T = np.arange(10, N, 10)  # Generate return periods from 10 to <N in steps of 10
-        T = np.insert(T, 0, 2)   # Prepend 2
-        len_T = len(T)
-        rlArray = np.empty((self.len_endog, len_T, 4), dtype=np.float16)
-        for t in range(self.len_endog):
-            for n in range(len_T):
-                z_p, ci = self.return_level(gevFit=gevFit, return_period=T[n], ref_year=t, confidence=confidence)
-                rlArray[t, n, 1] = z_p
-                rlArray[t, n, 2] = ci[0]
-                rlArray[t, n, 3] = ci[1]
-        rlArray[:, :, 0] = T      # Assign return periods to first column
-        return rlArray
+        )
 
 # The fit object, this object serves to compare different fits, print the fitting summary, and produce qq plots as well as data plots. 
 class GEVFit():
@@ -849,14 +753,151 @@ class GEVFit():
 
         # Show the plot
         plt.show()
-class GEVReturnLevel():
-    def __init__(self,GEVFit,rlArray):
-        self.rlArray = rlArray
-        self.GEVFit = GEVFit
 
-    def get_returnLevel(self,returnPeriod,t):
-        return 0
-    
+class GEVReturnLevel:
+    def __init__(self, gevFit, t, T, confidence=0.95):
+        self.gevFit = gevFit
+        self.t = np.array(t)  # User-specified time vector
+        self.T = np.array(T)  # User-specified return periods
+        self.confidence = confidence
+
+    def return_level_at(self, t, T, confidence=0.95):
+        """
+        Computes the return level of the Generalized Extreme Value (GEV) distribution for a given return period T.
+        If method is set to "delta", the confidence interval is estimated using the delta method.
+
+        Args:
+            T (float): Return period.
+            shape (float): Shape parameter (ξ) of the GEV distribution.
+            location (float): Location parameter (μ) of the GEV distribution.
+            scale (float): Scale parameter (σ) of the GEV distribution.
+            cov_matrix (np.ndarray, optional): Covariance matrix of the parameter estimates. Required for the delta method.
+            method (str, optional): Method for confidence interval estimation. Defaults to "delta".
+            confidence (float, optional): Confidence level for the interval. Defaults to 0.95.
+
+        Returns:
+            tuple: Return level estimate and confidence interval (lower, upper).
+        """
+        if T <= 1:
+            raise ValueError("Return period must be greater than 1.")
+        
+        if not self.gevFit.trans:
+            if t is not None:
+                warnings.warn(
+                    "Reference years are not required in a stationary model. Each year has the same return level for a given return period.",
+                    UserWarning
+                )
+            loc, scale, shape = self.gevFit.gev_params[0][0], self.gevFit.gev_params[1][0], self.gevFit.gev_params[2][0]
+        else:
+            if t is None:
+                raise ValueError(
+                    "A reference year must be provided in a non-stationary model since return levels vary over time for a given return period."
+                )
+            elif t >= self.gevFit.len_endog:
+                raise ValueError(
+                    "You can not get the future return levels but only present or past return levels."
+                )
+            loc, scale, shape = self.gevFit.gev_params[0][t], self.gevFit.gev_params[1][t], self.gevFit.gev_params[2][t]
+
+        
+         # Compute the return level (Coles, 2001)
+        y_p = -np.log(1 - 1/T)
+        z_p = loc - scale * np.log(y_p) if shape == 0 or np.isclose(1/T, 0) else loc - (scale / shape) * (1 - y_p**(-shape))
+        params = self.gevFit.fitted_params
+
+        if not self.gevFit.trans:  # Stationary
+            _ , sigma_t, xi_t = params
+            X_mu = self.gevFit.exog['location'][0]
+            X_sigma = self.gevFit.exog['scale'][0]
+            X_xi =  self.gevFit.exog['shape'][0]
+        else:  # Non-stationary
+            i, j, _ = self.gevFit.len_exog
+            X_mu = self.gevFit.exog['location'][t]
+            X_sigma = self.gevFit.exog['scale'][t]
+            X_xi = self.gevFit.exog['shape'][t]
+            sigma_t = np.dot(X_sigma, params[i:i+j])
+            xi_t = np.dot(X_xi, params[i+j:])
+
+        if np.isclose(xi_t, 0):
+            d_zp_d_mu = 1
+            d_zp_d_sigma = -np.log(y_p)
+            d_zp_d_xi = 0
+        else:
+            temp = y_p ** (-xi_t)
+            d_zp_d_mu = 1
+            d_zp_d_sigma = -(1 - temp) / xi_t
+            d_zp_d_xi = (sigma_t / xi_t**2) * (1 - temp) - (sigma_t / xi_t) * temp * np.log(y_p)
+
+        # Construct gradient vector
+        gradient = np.concatenate([d_zp_d_mu * X_mu, d_zp_d_sigma * X_sigma, d_zp_d_xi * X_xi])
+        # Estimate standard error using the delta method
+        variance = gradient @ self.gevFit.cov_matrix.todense() @ gradient.T
+        std_error = np.sqrt(variance)
+
+        alpha = 1 - confidence
+        z_crit = norm.ppf(1 - alpha / 2)
+        ci_lower = z_p - z_crit * std_error
+        ci_upper = z_p + z_crit * std_error
+
+        return z_p[0], (ci_lower[0], ci_upper[0])
+        
+
+    def return_level_summary(self):
+        """
+        Computes return levels and confidence intervals over multiple return periods and time steps.
+        
+        Raises:
+            ValueError: If T, t, or confidence is None, advising the user to call set_summary_parameters.
+        """
+        if self.T is None or self.t is None or self.confidence is None:
+            raise ValueError(
+                "Return periods (T), time steps (t), or confidence level are not set. "
+                "Please call `set_summary_parameters(T, t, confidence)` before using `return_level_summary`."
+            )
+
+        len_T = len(self.T)
+        len_t = len(self.t)
+        rlArray = np.empty((len_t, len_T, 5), dtype=np.float16)
+
+        for i, t_val in enumerate(self.t):
+            for j, T_val in enumerate(self.T):
+                z_p, ci = self.return_level_at(
+                    T=T_val, t=t_val, confidence=self.confidence
+                )
+                rlArray[i, j, 2] = z_p    # Estimated return level
+                rlArray[i, j, 3] = ci[0]  # Lower confidence bound
+                rlArray[i, j, 4] = ci[1]  # Upper confidence 
+        
+        print(rlArray[:, :, 0].shape)
+        rlArray[:, :, 0] = self.t[:,None]
+        rlArray[:, :, 1] = self.T
+        return rlArray
+        
+
+    def set_summary_parameters(self, confidence=None, t=None, T=None):
+        """
+        Sets the summary parameters for return level computations.
+
+        Args:
+            confidence (float, optional): Confidence level for return level estimation.
+            T (list or np.array, optional): Return period vector.
+            t (list or np.array, optional): Time vector.
+
+        If all parameters are None, a warning is displayed suggesting the user set at least one parameter.
+        """
+        if confidence is not None:
+            self.confidence = confidence
+        if T is not None:
+            self.T = T
+        if t is not None:
+            self.t = t
+
+        if confidence is None and T is None and t is None:
+            warnings.warn(
+                "No parameters were set. Please specify at least one of `confidence`, `Return Period : T`, or `Reference time : t`.",
+                UserWarning
+            )
+        
 class GEV_WWA(GEV):
     def __init__(self, endog, exog=None, loc_link=None, scale_link=None, shape_link=None, **kwargs):
         super().__init__(endog, exog, loc_link, scale_link, shape_link, **kwargs)
@@ -1072,7 +1113,7 @@ if __name__ == "__main__":
     #
     # Dummy endog variable (10 samples)
     
-    exog = {"location" : EOBS[["tempanomalyMean","random_value"]], "scale" :  EOBS[["tempanomalyMean","random_value"]]}
+    exog = {"location" : EOBS[["tempanomalyMean"]], "scale" :  EOBS[["tempanomalyMean"]]}
     #model = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
@@ -1082,7 +1123,7 @@ if __name__ == "__main__":
     #test.data_plot(time=EOBS["year"])
 
     a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
-    print(a1.return_levels(gevFit=a1.fit(fit_method='mle'))[30][0])
+    print(a1.return_level(gevFit=a1.fit(fit_method='mle'),T=[10,20,30], t = [30,65]).return_level_summary())
     #a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1))
     #print(a1.len_exog)
 
