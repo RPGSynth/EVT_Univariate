@@ -49,17 +49,28 @@ class GEV(ABC):
         self, 
         loc_link: Optional[Callable] = None,
         scale_link: Optional[Callable] = None,
-        shape_link: Optional[Callable] = None):
+        shape_link: Optional[Callable] = None,
+        loc_return_level_reparam : bool = False,
+        T : Optional[int] = None
+        ):
         """
         Initializes the GEV model with specified parameters.
         
         Parameters
         ----------
-        To be remade
+        To be made
         """
         self.loc_link = loc_link
         self.scale_link = scale_link
         self.shape_link = shape_link
+        self.loc_return_level_reparam = loc_return_level_reparam
+        if self.loc_return_level_reparam:
+            if T is None or T<=1 :
+                raise ValueError(
+                    "Location has been reparameterized using return levels. "
+                    "To obtain valid return levels, you must specify a return period (T) greater than 1."
+                )
+            self.T = T
 
 
     def nloglike(self, free_params, forced_index=-1,forced_param_value=0):
@@ -78,11 +89,22 @@ class GEV(ABC):
             else:
                 params[k] = free_params[free_index] # Use optimized parameter
                 free_index += 1
-        
+
+                
         # Compute location, scale, and shape parameters
-        location = self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)))
         scale = self.scale_link(np.dot(self.exog['scale'], params[i:i+j].reshape(-1,1)))
         shape = self.shape_link(np.dot(self.exog['shape'], params[i+j:].reshape(-1,1)))
+        if self.loc_return_level_reparam:
+            zp = self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1, 1)))
+            y_p = -np.log(1 - 1/self.T)
+            # Express location in terms of zp
+            location = np.where(
+                np.isclose(shape, 0,atol=1e-3),  
+                zp + scale * np.log(y_p),
+                zp + (scale / shape) * (1 - y_p**(-shape))  # Standard case
+            )
+        else:
+            location = self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)))
         # GEV transformation
         normalized_data = (self.endog - location) / scale
         if np.allclose(shape, 0):  # Treat shape = 0 separately
@@ -105,7 +127,7 @@ class GEV(ABC):
                 + np.sum(np.log(transformed_data) * (1 + 1 / shape))
             )
 
-        return log_likelihood 
+        return log_likelihood
 
     def loglike(self,params):
         return -(self.nloglike(params))
@@ -132,7 +154,7 @@ class GEV(ABC):
         pass
 
 class GEVSample(GEV):
-    def __init__(self, endog, exog={'shape': None, 'scale': None, 'location': None}, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, **kwargs):
+    def __init__(self, endog, exog={'shape': None, 'scale': None, 'location': None}, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, loc_return_level_reparam = False, T=-1, **kwargs):
         """
         Initializes the GEV model for a data sample with specified parameters.
         
@@ -163,8 +185,7 @@ class GEVSample(GEV):
         """
         #----------Initiate common parameters-----------
 
-        super().__init__(loc_link=loc_link,scale_link=scale_link,shape_link=shape_link)
-
+        super().__init__(loc_link=loc_link,scale_link=scale_link,shape_link=shape_link,loc_return_level_reparam=loc_return_level_reparam,T=T)
         #----------Deal with Endog input-----------------
         # Exceptions
 
@@ -371,14 +392,14 @@ class GEVSample(GEV):
         else:
             raise ValueError("Model is not fitted. Cannot compute the score at optimal parameters.")
 
-    def _generate_profile_params(self, param_idx, n,mle_params):
+    def _generate_profile_params(self, param_idx, n,mle_params,stds):
         """Generate profile parameter values based on param index rules."""
         i, j, k = self.len_exog  # Extract external indices
         
         param_ranges = {
-            0: np.linspace(mle_params[0] / 1.5, mle_params[0] * 1.5, n),
-            i: np.linspace(mle_params[i] / 1.5, mle_params[i] * 1.5, n),
-            i + j: np.linspace(mle_params[i+j] - 0.2, mle_params[i+j] + 0.2, n)
+            0: np.linspace(mle_params[0] - 2*stds[0], mle_params[0] + 2*stds[0], n),
+            i: np.linspace(mle_params[i] - 2*stds[i], mle_params[i] + 2*stds[i], n),
+            i + j: np.linspace(mle_params[i+j] - 2*stds[i+j], mle_params[i+j]  + 2*stds[i+j], n)
         }
         return param_ranges.get(param_idx, np.linspace(mle_params[param_idx] / 1.5, mle_params[param_idx] * 1.5, n))
 
@@ -400,11 +421,11 @@ class GEVSample(GEV):
 
         #Made to be run in a parallel computing framework 
     def _optimize_profile_parallel(self,args):
-        param_idx,n,optim_method,mle_params = args
+        param_idx,n,optim_method,mle_params,stds = args
         profile_mles = np.empty(n)
         param_values = np.empty(n)
 
-        profile_params = self._generate_profile_params(param_idx=param_idx,n=n,mle_params=mle_params)
+        profile_params = self._generate_profile_params(param_idx=param_idx,n=n,mle_params=mle_params,stds=stds)
         free_params = self._generate_free_params(param_idx=param_idx)
         for n_i, param_value in enumerate(profile_params):
                     nloglike_partial = partial(self.nloglike,forced_index=param_idx,forced_param_value=param_value)
@@ -454,7 +475,8 @@ class GEVSample(GEV):
             cov_matrix=self.result.hess_inv,
             jacobian=self.result.jac,
             CIs=self._compute_CIs_mle(self.result.hess_inv.todense(), self.result.x, 0.95),
-            fit_method='MLE'
+            fit_method='MLE',
+            rl_info = (self.loc_return_level_reparam,self.T)
         )
 
     def _fit_profile(self, start_params, optim_method, **kwargs):
@@ -462,11 +484,10 @@ class GEVSample(GEV):
         n = 1000
         mle_model = self.fit(start_params, optim_method, fit_method='MLE')
         fitted_params = mle_model.fitted_params
-        
+        stds = np.sqrt(np.diag(mle_model.cov_matrix.todense()))
         all_profile_mles = np.empty((self.nparams, n))
         all_param_values = np.empty((self.nparams, n))
-        args = [(param_idx, n, optim_method, fitted_params) for param_idx in range(self.nparams)]
-        
+        args = [(param_idx, n, optim_method, fitted_params,stds) for param_idx in range(self.nparams)]
         start_time = time.perf_counter()
         with ProcessPoolExecutor() as executor:
             for param_idx, profile_mles, param_values in executor.map(self._optimize_profile_parallel, args):
@@ -476,7 +497,7 @@ class GEVSample(GEV):
         end_time = time.perf_counter()
         print(f"Execution Time: {end_time - start_time:.4f} seconds")
 
-        i, j, k = self.len_exog
+        i, j, _ = self.len_exog
         fitted_loc = self.loc_link(self.exog['location'] @ fitted_params[:i]).reshape(-1, 1)
         fitted_scale = self.scale_link(self.exog['scale'] @ fitted_params[i:i+j]).reshape(-1, 1)
         fitted_shape = self.shape_link(self.exog['shape'] @ fitted_params[i+j:]).reshape(-1, 1)
@@ -493,7 +514,8 @@ class GEVSample(GEV):
             cov_matrix=mle_model.cov_matrix,
             jacobian=mle_model.jacobian,
             CIs=self._compute_CIs_profile(all_param_values, all_profile_mles, fitted_params, 0.95),
-            fit_method='Profile'
+            fit_method='Profile',
+            rl_info = (self.loc_return_level_reparam,self.T)
         )
 
 
@@ -536,17 +558,19 @@ class GEVSample(GEV):
         Returns:
         - A `GEVReturnLevel` object that can compute return levels on demand.
         """
-        return GEVReturnLevel(
-            gevFit=gevFit,
-            t=t,
-            T=T,
-            confidence=confidence
-
-        )
+        if gevFit.fit_method.lower() == 'mle':
+            return GEVReturnLevel(
+                gevFit=gevFit,
+                t=t,
+                T=T,
+                confidence=confidence
+            )
+        else:
+            return 0
 
 # The fit object, this object serves to compare different fits, print the fitting summary, and produce qq plots as well as data plots. 
 class GEVFit():
-    def __init__(self, fitted_params, endog, len_endog, exog, len_exog, trans,gev_params,log_likelihood,cov_matrix,jacobian, CIs, fit_method):
+    def __init__(self, fitted_params, endog, len_endog, exog, len_exog, trans,gev_params,log_likelihood,cov_matrix,jacobian, CIs, fit_method, rl_info):
             # Extract relevant attributes from optimize_result and give them meaningful names
             self.fitted_params = fitted_params
             self.endog = endog
@@ -561,6 +585,7 @@ class GEVFit():
             self.nparams = self.fitted_params.size
             self.CIs = CIs
             self.fit_method = fit_method
+            self.rl_info = rl_info
     def AIC(self):
         if self.fit_method.lower() != 'mle':
             warnings.warn(f"AIC is based on MLE estimation, not on '{self.fit_method}'.", UserWarning)
@@ -613,16 +638,22 @@ class GEVFit():
         result_str += "=" * len(separator) + "\n"
         result_str += "          EVT Results Summary       \n"
         result_str += "=" * len(separator) + "\n"
+        result_str += f"Data dimensions : {self.endog.shape}\n"
         result_str += f"AIC: {aic:.2f}  {aic_bic_note}\n"
         result_str += f"BIC: {bic:.2f}  \n\n"
+
+        # If reparameterization is active, add a clarification line
+        if self.rl_info:
+            result_str += f"*Note: Location (μ) was reparameterized using return levels zp for a return period T = {self.rl_info[1]}\n\n"
+
         result_str += separator + "\n"
         result_str += header + "\n"
         result_str += separator + "\n"
 
         len_mu, len_sigma, len_xi = self.len_exog
-        param_names = [f"μ_{n}" for n in range(len_mu)] + \
-                  [f"σ_{n}" for n in range(len_sigma)] + \
-                  [f"ξ_{n}" for n in range(len_xi)]
+        param_names = [f"{'zp' if self.rl_info[0] else 'μ'}_{n}" for n in range(len_mu)] + \
+                    [f"σ_{n}" for n in range(len_sigma)] + \
+                    [f"ξ_{n}" for n in range(len_xi)]
 
         # Iterate over parameters and format each row
         for i, param_name in enumerate(param_names):
@@ -655,9 +686,10 @@ class GEVFit():
                         f"| {signif:<{col_widths[5]}} |\n")
 
         result_str += separator + "\n"
-        result_str += "Notes: *** p<0.001, ** p<0.01, * p<0.05\n"
+        result_str += "Significance : *** p<0.001, ** p<0.01, * p<0.05\n"
 
         return result_str
+
     
     def _gev_params_to_quantiles(self,p):
         """
@@ -803,6 +835,7 @@ class GEVReturnLevel:
          # Compute the return level (Coles, 2001)
         y_p = -np.log(1 - 1/T)
         z_p = loc - scale * np.log(y_p) if shape == 0 or np.isclose(1/T, 0) else loc - (scale / shape) * (1 - y_p**(-shape))
+
         params = self.gevFit.fitted_params
 
         if not self.gevFit.trans:  # Stationary
@@ -834,12 +867,15 @@ class GEVReturnLevel:
         variance = gradient @ self.gevFit.cov_matrix.todense() @ gradient.T
         std_error = np.sqrt(variance)
 
-        alpha = 1 - confidence
-        z_crit = norm.ppf(1 - alpha / 2)
-        ci_lower = z_p - z_crit * std_error
-        ci_upper = z_p + z_crit * std_error
-
-        return z_p[0], (ci_lower[0], ci_upper[0])
+        if self.gevFit.fit_method.lower() == 'mle':
+            alpha = 1 - confidence
+            z_crit = norm.ppf(1 - alpha / 2)
+            ci_lower = z_p - z_crit * std_error
+            ci_upper = z_p + z_crit * std_error
+            return z_p[0], (ci_lower[0], ci_upper[0])
+        else: 
+            n = 1000
+            profile_params = np.linspace(z_p - 2*std_error, z_p + 2*std_error, n)
         
 
     def return_level_summary(self):
@@ -868,7 +904,6 @@ class GEVReturnLevel:
                 rlArray[i, j, 3] = ci[0]  # Lower confidence bound
                 rlArray[i, j, 4] = ci[1]  # Upper confidence 
         
-        print(rlArray[:, :, 0].shape)
         rlArray[:, :, 0] = self.t[:,None]
         rlArray[:, :, 1] = self.T
         return rlArray
@@ -1113,7 +1148,7 @@ if __name__ == "__main__":
     #
     # Dummy endog variable (10 samples)
     
-    exog = {"location" : EOBS[["tempanomalyMean"]], "scale" :  EOBS[["tempanomalyMean"]]}
+    exog = {"location" : EOBS[["tempanomalyMean"]]}
     #model = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
@@ -1122,8 +1157,8 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
-    print(a1.return_level(gevFit=a1.fit(fit_method='mle'),T=[10,20,30], t = [30,65]).return_level_summary())
+    a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog, loc_return_level_reparam=True, T=1000)
+    print(a1.fit(fit_method='Profile'))
     #a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1))
     #print(a1.len_exog)
 
