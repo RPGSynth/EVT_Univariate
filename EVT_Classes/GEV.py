@@ -99,7 +99,7 @@ class GEV(ABC):
             y_p = -np.log(1 - 1/self.T)
             # Express location in terms of zp
             location = np.where(
-                np.isclose(shape, 0,atol=1e-3),  
+                np.isclose(shape, 0),  
                 zp + scale * np.log(y_p),
                 zp + (scale / shape) * (1 - y_p**(-shape))  # Standard case
             )
@@ -558,15 +558,19 @@ class GEVSample(GEV):
         Returns:
         - A `GEVReturnLevel` object that can compute return levels on demand.
         """
-        if gevFit.fit_method.lower() == 'mle':
+        if gevFit.rl_info[0]:
+            return GEVReturnLevel_reparam(
+                gevFit=gevFit,
+                t=t,
+                confidence=confidence
+            )
+        else:
             return GEVReturnLevel(
                 gevFit=gevFit,
                 t=t,
                 T=T,
                 confidence=confidence
             )
-        else:
-            return 0
 
 # The fit object, this object serves to compare different fits, print the fitting summary, and produce qq plots as well as data plots. 
 class GEVFit():
@@ -789,8 +793,8 @@ class GEVFit():
 class GEVReturnLevel:
     def __init__(self, gevFit, t, T, confidence=0.95):
         self.gevFit = gevFit
-        self.t = np.array(t)  # User-specified time vector
-        self.T = np.array(T)  # User-specified return periods
+        self.T = np.array(T)  # User-specified time vector
+        self.t = np.array(t)  # User-specified return periods
         self.confidence = confidence
 
     def return_level_at(self, t, T, confidence=0.95):
@@ -893,10 +897,10 @@ class GEVReturnLevel:
 
         len_T = len(self.T)
         len_t = len(self.t)
-        rlArray = np.empty((len_t, len_T, 5), dtype=np.float16)
+        rlArray = np.empty((len_T, len_t, 5), dtype=np.float16)
 
-        for i, t_val in enumerate(self.t):
-            for j, T_val in enumerate(self.T):
+        for i, T_val in enumerate(self.T):
+            for j, t_val in enumerate(self.t):
                 z_p, ci = self.return_level_at(
                     T=T_val, t=t_val, confidence=self.confidence
                 )
@@ -904,8 +908,8 @@ class GEVReturnLevel:
                 rlArray[i, j, 3] = ci[0]  # Lower confidence bound
                 rlArray[i, j, 4] = ci[1]  # Upper confidence 
         
-        rlArray[:, :, 0] = self.t[:,None]
-        rlArray[:, :, 1] = self.T
+        rlArray[:, :, 0] = self.T[:,None]
+        rlArray[:, :, 1] = self.t
         return rlArray
         
 
@@ -932,7 +936,56 @@ class GEVReturnLevel:
                 "No parameters were set. Please specify at least one of `confidence`, `Return Period : T`, or `Reference time : t`.",
                 UserWarning
             )
-        
+
+class GEVReturnLevel_reparam:
+    def __init__(self, gevFit, t, confidence=0.95):
+        self.gevFit = gevFit
+        self.t = t
+        self.confidence = confidence
+
+    def return_level_at(self, t):
+        if self.gevFit.fit_method.lower()=='mle':
+            i,_,_ = self.gevFit.len_exog
+            zp_cov_matrix = self.gevFit.cov_matrix.todense()[:i,:i]
+            X_zp_selected = self.gevFit.exog['location'][t]
+            se = np.sqrt(np.einsum('ij,jk,ik->i', X_zp_selected.reshape(-1,1), zp_cov_matrix, X_zp_selected.reshape(-1,1)))
+            print
+            zp = np.einsum('i,i -> ',X_zp_selected,self.gevFit.fitted_params[:i])
+            z_score = norm.ppf(0.975) 
+            lower_bound = zp- z_score * se
+            upper_bound = zp + z_score * se
+            return self.gevFit.fitted_params[0], (lower_bound.item(),upper_bound.item())
+        return 0
+    
+    def return_level_summary(self):
+        rlArray = np.empty((1, len(self.t), 5), dtype=np.float32)
+
+        if self.gevFit.fit_method.lower() == 'mle':
+            i, _, _ = self.gevFit.len_exog
+            zp_cov_matrix = self.gevFit.cov_matrix.todense()[:i, :i]
+            X_zp = self.gevFit.exog['location']  
+
+            # Extract only the requested rows from X_zp
+            X_zp_selected = X_zp[self.t]  
+
+            # Compute standard errors efficiently using batch multiplication
+            se = np.sqrt(np.einsum('ij,jk,ik->i', X_zp_selected, zp_cov_matrix, X_zp_selected))
+            zp = np.einsum('ij,j -> i',X_zp_selected,self.gevFit.fitted_params[:i])
+            # Compute confidence interval bounds
+            z_score = norm.ppf(0.975)  # 95% CI
+            lower_bound = self.gevFit.fitted_params[0] - z_score * se
+            upper_bound = self.gevFit.fitted_params[0] + z_score * se
+            # Combine results into a final array
+            rlArray[0, :, 0] = self.gevFit.rl_info[1]*np.ones(len(self.t))
+            rlArray[0, :, 1] = self.t  
+            rlArray[0, :, 2] = se
+            rlArray[0, :, 3] = lower_bound
+            rlArray[0, :, 4] = upper_bound
+            return rlArray
+
+        return 0
+
+    
 class GEV_WWA(GEV):
     def __init__(self, endog, exog=None, loc_link=None, scale_link=None, shape_link=None, **kwargs):
         super().__init__(endog, exog, loc_link, scale_link, shape_link, **kwargs)
@@ -1157,8 +1210,12 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog, loc_return_level_reparam=True, T=1000)
-    print(a1.fit(fit_method='Profile'))
+    a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog, loc_return_level_reparam=True, T=100)
+    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_summary())
+    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_at(t=9))
+    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_at(t=10))
+    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_at(t=50))
+    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_at(t=60))
     #a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1))
     #print(a1.len_exog)
 
