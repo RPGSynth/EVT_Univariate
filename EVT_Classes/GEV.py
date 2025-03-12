@@ -20,6 +20,9 @@ from functools import partial
 import time
 from typing import Dict, Union, Optional, Callable, Any, List, Tuple
 from abc import ABC, abstractmethod
+import logging
+
+logging.basicConfig(level=logging.INFO)  # Set logging level to show info messages
 
 class GEV(ABC):
     """
@@ -50,7 +53,6 @@ class GEV(ABC):
         loc_link: Optional[Callable] = None,
         scale_link: Optional[Callable] = None,
         shape_link: Optional[Callable] = None,
-        loc_return_level_reparam : bool = False,
         T : Optional[int] = None
         ):
         """
@@ -63,27 +65,23 @@ class GEV(ABC):
         self.loc_link = loc_link
         self.scale_link = scale_link
         self.shape_link = shape_link
-        self.loc_return_level_reparam = loc_return_level_reparam
+        self.loc_return_level_reparam = T is not None and T > 1
         if self.loc_return_level_reparam:
-            if T is None or T<=1 :
-                raise ValueError(
-                    "Location has been reparameterized using return levels. "
-                    "To obtain valid return levels, you must specify a return period (T) greater than 1."
-                )
-            self.T = T
+            logging.info("ℹ️ The location parameter (μ) will be redefined in terms of return levels (z_p), "
+                 "as you have specified a return period (T).")
+        self.T = T
 
 
     def nloglike(self, free_params, forced_index=-1,forced_param_value=0):
         """
         Computes the negative log-likelihood of the GEV model.
         """
-
         # Extract the number of covariates for each parameter
         i, j, _ = self.len_exog
-        params = np.ones(self.nparams)
+        params = np.ones(sum(self.len_exog))
         free_index = 0
 
-        for k in range(self.nparams):  # Total number of parameters
+        for k in range(sum(self.len_exog)):  # Total number of parameters
             if k == forced_index:
                 params[k] = forced_param_value  # Use fixed parameter value
             else:
@@ -126,7 +124,6 @@ class GEV(ABC):
                 + np.sum(transformed_data ** (-1 / shape))
                 + np.sum(np.log(transformed_data) * (1 + 1 / shape))
             )
-
         return log_likelihood
 
     def loglike(self,params):
@@ -149,12 +146,8 @@ class GEV(ABC):
         """
         raise NotImplementedError("Subclasses must implement this method.")
 
-    @abstractmethod
-    def return_level(self):
-        pass
-
 class GEVSample(GEV):
-    def __init__(self, endog, exog={'shape': None, 'scale': None, 'location': None}, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, loc_return_level_reparam = False, T=-1, **kwargs):
+    def __init__(self, endog, exog={'shape': None, 'scale': None, 'location': None}, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, T=None, **kwargs):
         """
         Initializes the GEV model for a data sample with specified parameters.
         
@@ -185,7 +178,7 @@ class GEVSample(GEV):
         """
         #----------Initiate common parameters-----------
 
-        super().__init__(loc_link=loc_link,scale_link=scale_link,shape_link=shape_link,loc_return_level_reparam=loc_return_level_reparam,T=T)
+        super().__init__(loc_link=loc_link,scale_link=scale_link,shape_link=shape_link,T=T)
         #----------Deal with Endog input-----------------
         # Exceptions
 
@@ -439,14 +432,20 @@ class GEVSample(GEV):
         """
         Fits the model using the specified method (MLE or Profile).
         """
-        if fit_method.lower() == 'mle':
-            return self._fit_mle(start_params, optim_method)
-        elif fit_method.lower() == 'profile':
-            return self._fit_profile(start_params, optim_method)
-        else:
-            raise ValueError("Unsupported fit method. Choose 'MLE' or 'Profile'.")
+        RL_args = {"reparam": self.loc_return_level_reparam}
 
-    def _fit_mle(self, start_params, optim_method):
+        if RL_args["reparam"]:  # Only include T if reparam is True
+            RL_args["T"] = self.T
+
+        match fit_method.lower():
+            case "mle":
+                return self._fit_mle(start_params, optim_method, RL_args)
+            case "profile":
+                return self._fit_profile(start_params, optim_method, RL_args)
+            case _:
+                raise ValueError("Unsupported fit method. Choose 'MLE' or 'Profile'.")
+
+    def _fit_mle(self, start_params, optim_method,RL_args):
         """Performs Maximum Likelihood Estimation (MLE)."""
         i, j, k = self.len_exog
         
@@ -458,28 +457,23 @@ class GEVSample(GEV):
             )
         
         self.result = minimize(self.nloglike, start_params, method=optim_method)
-
         fitted_loc = self.loc_link(self.exog['location'] @ self.result.x[:i]).reshape(-1, 1)
         fitted_scale = self.scale_link(self.exog['scale'] @ self.result.x[i:i+j]).reshape(-1, 1)
         fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[i+j:]).reshape(-1, 1)
 
         return GEVFit(
+            gevSample = self,
             fitted_params=self.result.x,
-            endog=self.endog,
-            len_endog=self.len_endog,
-            exog=self.exog,
-            len_exog=self.len_exog,
-            trans=self.trans,
             gev_params=(fitted_loc, fitted_scale, fitted_shape),
-            log_likelihood=self.result.fun,
+            n_ll=self.result.fun,
             cov_matrix=self.result.hess_inv,
             jacobian=self.result.jac,
             CIs=self._compute_CIs_mle(self.result.hess_inv.todense(), self.result.x, 0.95),
             fit_method='MLE',
-            rl_info = (self.loc_return_level_reparam,self.T)
+            RL_args = RL_args
         )
 
-    def _fit_profile(self, start_params, optim_method, **kwargs):
+    def _fit_profile(self, start_params, optim_method, RL_args,**kwargs):
         """Performs Profile Likelihood Estimation."""
         n = 1000
         mle_model = self.fit(start_params, optim_method, fit_method='MLE')
@@ -497,43 +491,56 @@ class GEVSample(GEV):
         end_time = time.perf_counter()
         print(f"Execution Time: {end_time - start_time:.4f} seconds")
 
-        i, j, _ = self.len_exog
-        fitted_loc = self.loc_link(self.exog['location'] @ fitted_params[:i]).reshape(-1, 1)
-        fitted_scale = self.scale_link(self.exog['scale'] @ fitted_params[i:i+j]).reshape(-1, 1)
-        fitted_shape = self.shape_link(self.exog['shape'] @ fitted_params[i+j:]).reshape(-1, 1)
+        i, j, _ = self.gevSample.len_exog
+        fitted_loc = self.gevSample.loc_link(self.gevSample.exog['location'] @ fitted_params[:i]).reshape(-1, 1)
+        fitted_scale = self.gevSample.scale_link(self.gevSample.exog['scale'] @ fitted_params[i:i+j]).reshape(-1, 1)
+        fitted_shape = self.gevSample.shape_link(self.gevSample.exog['shape'] @ fitted_params[i+j:]).reshape(-1, 1)
         
         return GEVFit(
+            gevSample = self,
             fitted_params=fitted_params,
-            endog=self.endog,
-            len_endog=self.len_endog,
-            exog=self.exog,
-            len_exog=self.len_exog,
-            trans=self.trans,
             gev_params=(fitted_loc, fitted_scale, fitted_shape),
-            log_likelihood=mle_model.log_likelihood,
+            n_ll=mle_model.n_ll,
             cov_matrix=mle_model.cov_matrix,
             jacobian=mle_model.jacobian,
             CIs=self._compute_CIs_profile(all_param_values, all_profile_mles, fitted_params, 0.95),
             fit_method='Profile',
-            rl_info = (self.loc_return_level_reparam,self.T)
+            RL_args = RL_args
         )
 
 
-    def _compute_CIs_mle(self,cov_matrix,fitted_params,treshold):
-        CIs = np.empty((len(fitted_params),4))
-        se =  np.sqrt(np.diag(cov_matrix))
+    def _compute_CIs_mle(self,cov_matrix,fitted_params,threshold):
+        """
+        Compute Confidence Intervals (CIs) for Maximum Likelihood Estimation (MLE)
+        
+        Parameters:
+        - cov_matrix: Covariance matrix of the fitted parameters
+        - fitted_params: Array of estimated parameters
+        - threshold: Confidence level (e.g., 0.95 for 95% CI)
+        
+        Returns:
+        - CIs: Array containing lower bound, upper bound, p-value, and z-score for each parameter
+        """
+        # Convert confidence level to critical z-score
+        z_critical = norm.ppf(1 - (1 - threshold) / 2)  # Two-tailed z-score
+
+        CIs = np.empty((len(fitted_params), 4))
+        se = np.sqrt(np.diag(cov_matrix))  # Standard errors
+
         for i in range(len(fitted_params)):
-            lower_bound = fitted_params[i] - 1.96 * se[i]
-            upper_bound = fitted_params[i] + 1.96 * se[i]
+            lower_bound = fitted_params[i] - z_critical * se[i]
+            upper_bound = fitted_params[i] + z_critical * se[i]
             z_score = fitted_params[i] / se[i]
-            p_value = 2 * (1 - norm.cdf(np.abs(z_score)))
-            CIs[i][0],CIs[i][1],CIs[i][2],CIs[i][3] = (lower_bound,upper_bound,p_value,z_score)
+            p_value = 2 * (1 - norm.cdf(np.abs(z_score)))  # Two-tailed p-value
+
+            CIs[i] = [lower_bound, upper_bound, p_value, z_score]
+
         return CIs
 
-    def _compute_CIs_profile(self, all_param_values, all_profile_mles, fitted_params, treshold):
+    def _compute_CIs_profile(self, all_param_values, all_profile_mles, fitted_params, threshold):
         CIs = np.empty((len(fitted_params),4))
         for i in range(len(fitted_params)):
-            chi2_threshold   = chi2.ppf(treshold, df=1)/2
+            chi2_threshold   = chi2.ppf(threshold, df=1)/2
             free_params = self._generate_free_params(param_idx = i,fixed_param_values=fitted_params)
             cutoff = all_profile_mles[i] - all_profile_mles[i][np.argmin(all_profile_mles[i])]
             indices = np.where(cutoff<=chi2_threshold)[0]
@@ -542,63 +549,32 @@ class GEVSample(GEV):
 
             deviance = 2*(self.nloglike(free_params=free_params,forced_index=i,forced_param_value=0.0001) - self.nloglike(free_params=fitted_params))
             p_value = chi2.sf(deviance, df=1)
-            CIs[i][0],CIs[i][1],CIs[i][2],CIs[i][3] = (lower_bound,upper_bound,p_value,deviance)
+            CIs[i]= [lower_bound,upper_bound,p_value,deviance]
         return CIs
-
-    def return_level(self, gevFit, T=None, t=None, confidence=0.95):
-        """
-        Returns an object that can be used to compute return levels lazily.
-
-        Parameters:
-        - gevFit: The fitted GEV model.
-        - T: A list/array of return periods specified by the user.
-        - t: A list/array of time steps specified by the user.
-        - confidence: Confidence level for return level estimation.
-
-        Returns:
-        - A `GEVReturnLevel` object that can compute return levels on demand.
-        """
-        if gevFit.rl_info[0]:
-            return GEVReturnLevel_reparam(
-                gevFit=gevFit,
-                t=t,
-                confidence=confidence
-            )
-        else:
-            return GEVReturnLevel(
-                gevFit=gevFit,
-                t=t,
-                T=T,
-                confidence=confidence
-            )
 
 # The fit object, this object serves to compare different fits, print the fitting summary, and produce qq plots as well as data plots. 
 class GEVFit():
-    def __init__(self, fitted_params, endog, len_endog, exog, len_exog, trans,gev_params,log_likelihood,cov_matrix,jacobian, CIs, fit_method, rl_info):
+    def __init__(self, gevSample, fitted_params,gev_params,n_ll,cov_matrix,jacobian, CIs, fit_method, RL_args):
             # Extract relevant attributes from optimize_result and give them meaningful names
+            self.gevSample = gevSample
             self.fitted_params = fitted_params
-            self.endog = endog
-            self.len_endog = len_endog
-            self.exog = exog
-            self.len_exog = len_exog
-            self.trans = trans
             self.gev_params = gev_params
-            self.log_likelihood = log_likelihood
+            self.n_ll = n_ll
             self.cov_matrix = cov_matrix
             self.jacobian = jacobian
             self.nparams = self.fitted_params.size
             self.CIs = CIs
             self.fit_method = fit_method
-            self.rl_info = rl_info
+            self.RL_args = RL_args
     def AIC(self):
         if self.fit_method.lower() != 'mle':
             warnings.warn(f"AIC is based on MLE estimation, not on '{self.fit_method}'.", UserWarning)
-        return 2 * self.nparams + 2 * self.log_likelihood
+        return 2 * self.gevSample.nparams + 2 * self.n_ll
 
     def BIC(self):
         if self.fit_method.lower() != 'mle':
             warnings.warn(f"BIC is based on MLE estimation, not on '{self.fit_method}'.", UserWarning)
-        return self.nparams * np.log(self.len_endog) + 2 * self.log_likelihood
+        return self.gevSample.nparams * np.log(self.gevSample.len_endog) + 2 * self.n_ll
 
     def SE(self):
         # Compute standard errors using the inverse Hessian matrix
@@ -613,6 +589,35 @@ class GEVFit():
     
     def deviance(self):
         return 0
+    
+    def return_level(self, T=None, t=None, confidence=0.95):
+        """
+        Returns an object that can be used to compute return levels lazily.
+
+        Parameters:
+        - gevFit: The fitted GEV model.
+        - T: A list/array of return periods specified by the user.
+        - t: A list/array of time steps specified by the user.
+        - confidence: Confidence level for return level estimation.
+
+        Returns:
+        - A `GEVReturnLevel` object that can compute return levels on demand.
+        """
+        if self.RL_args["reparam"]:
+            if T is not None:
+                logging.info(f"Since the return period (T) was specified during model initialization as T = {self.RL_args.get('T')}, it can not be modified.")
+            return GEVReturnLevel_reparam(
+                gevFit=self,
+                t=t,
+                confidence=confidence
+            )
+        else:
+            return GEVReturnLevel(
+                gevFit=self,
+                t=t,
+                T=T,
+                confidence=confidence
+            )
     
     def __str__(self): 
         # Calculate fitted values, SE, z-scores, p-values, AIC, and BIC
@@ -642,20 +647,20 @@ class GEVFit():
         result_str += "=" * len(separator) + "\n"
         result_str += "          EVT Results Summary       \n"
         result_str += "=" * len(separator) + "\n"
-        result_str += f"Data dimensions : {self.endog.shape}\n"
+        result_str += f"Data dimensions : {self.gevSample.endog.shape}\n"
         result_str += f"AIC: {aic:.2f}  {aic_bic_note}\n"
         result_str += f"BIC: {bic:.2f}  \n\n"
 
         # If reparameterization is active, add a clarification line
-        if self.rl_info:
-            result_str += f"*Note: Location (μ) was reparameterized using return levels zp for a return period T = {self.rl_info[1]}\n\n"
+        if self.RL_args["reparam"]:
+            result_str += f"*Note: Location (μ) was reparameterized using return levels zp for a return period T = {self.RL_args.get('T', None) }\n\n"
 
         result_str += separator + "\n"
         result_str += header + "\n"
         result_str += separator + "\n"
 
-        len_mu, len_sigma, len_xi = self.len_exog
-        param_names = [f"{'zp' if self.rl_info[0] else 'μ'}_{n}" for n in range(len_mu)] + \
+        len_mu, len_sigma, len_xi = self.gevSample.len_exog
+        param_names = [f"{'zp' if self.RL_args['reparam'] else 'μ'}_{n}" for n in range(len_mu)] + \
                     [f"σ_{n}" for n in range(len_sigma)] + \
                     [f"ξ_{n}" for n in range(len_xi)]
 
@@ -790,25 +795,64 @@ class GEVFit():
         # Show the plot
         plt.show()
 
-class GEVReturnLevel:
-    def __init__(self, gevFit, t, T, confidence=0.95):
+class GEVReturnLevelBase(ABC):
+    """
+    Base class for GEV return level calculations.
+    
+    This class provides common functionality for calculating and summarizing return levels
+    for Generalized Extreme Value (GEV) distribution fits.
+    """
+    def __init__(self, gevFit, confidence=0.95):
+        """
+        Initialize the GEV return level calculator.
+        
+        Args:
+            gevFit: The GEV fit object containing model parameters and covariance matrix
+            confidence (float, optional): Confidence level for interval estimation. Defaults to 0.95.
+        """
         self.gevFit = gevFit
+        self.confidence = confidence
+    
+    @abstractmethod
+    def return_level_at(self, *args, **kwargs):
+        """
+        Abstract method to compute the return level at specific parameters.
+        
+        Must be implemented by subclasses with their specific parameter requirements.
+        
+        Returns:
+            tuple: Return level estimate and confidence interval (lower, upper).
+        """
+        raise NotImplementedError("Subclasses must implement return_level_at method")
+    
+    @abstractmethod
+    def summary(self):
+        """
+        Abstract method to compute return levels and confidence intervals
+        over multiple parameter combinations.
+        
+        Must be implemented by subclasses with their specific parameter requirements.
+        
+        Returns:
+            np.ndarray: Array of return level estimates and confidence intervals.
+        """
+        raise NotImplementedError("Subclasses must implement summary method")
+
+
+class GEVReturnLevel(GEVReturnLevelBase):
+    def __init__(self, gevFit, T, t, confidence=0.95):
+        super().__init__(gevFit, confidence)
         self.T = np.array(T)  # User-specified time vector
         self.t = np.array(t)  # User-specified return periods
-        self.confidence = confidence
 
-    def return_level_at(self, t, T, confidence=0.95):
+    def return_level_at(self, T, t, confidence=0.95):
         """
         Computes the return level of the Generalized Extreme Value (GEV) distribution for a given return period T.
         If method is set to "delta", the confidence interval is estimated using the delta method.
 
         Args:
             T (float): Return period.
-            shape (float): Shape parameter (ξ) of the GEV distribution.
-            location (float): Location parameter (μ) of the GEV distribution.
-            scale (float): Scale parameter (σ) of the GEV distribution.
-            cov_matrix (np.ndarray, optional): Covariance matrix of the parameter estimates. Required for the delta method.
-            method (str, optional): Method for confidence interval estimation. Defaults to "delta".
+            t (int, optional): Reference year for non-stationary models.
             confidence (float, optional): Confidence level for the interval. Defaults to 0.95.
 
         Returns:
@@ -817,7 +861,7 @@ class GEVReturnLevel:
         if T <= 1:
             raise ValueError("Return period must be greater than 1.")
         
-        if not self.gevFit.trans:
+        if not self.gevFit.gevSample.trans:
             if t is not None:
                 warnings.warn(
                     "Reference years are not required in a stationary model. Each year has the same return level for a given return period.",
@@ -829,7 +873,7 @@ class GEVReturnLevel:
                 raise ValueError(
                     "A reference year must be provided in a non-stationary model since return levels vary over time for a given return period."
                 )
-            elif t >= self.gevFit.len_endog:
+            elif t >= self.gevFit.gevSample.len_endog:
                 raise ValueError(
                     "You can not get the future return levels but only present or past return levels."
                 )
@@ -842,16 +886,16 @@ class GEVReturnLevel:
 
         params = self.gevFit.fitted_params
 
-        if not self.gevFit.trans:  # Stationary
+        if not self.gevFit.gevSample.trans:  # Stationary
             _ , sigma_t, xi_t = params
-            X_mu = self.gevFit.exog['location'][0]
-            X_sigma = self.gevFit.exog['scale'][0]
-            X_xi =  self.gevFit.exog['shape'][0]
+            X_mu = self.gevFit.gevSample.exog['location'][0]
+            X_sigma = self.gevFit.gevSample.exog['scale'][0]
+            X_xi =  self.gevFit.gevSample.exog['shape'][0]
         else:  # Non-stationary
-            i, j, _ = self.gevFit.len_exog
-            X_mu = self.gevFit.exog['location'][t]
-            X_sigma = self.gevFit.exog['scale'][t]
-            X_xi = self.gevFit.exog['shape'][t]
+            i, j, _ = self.gevFit.gevSample.len_exog
+            X_mu = self.gevFit.gevSample.exog['location'][t]
+            X_sigma = self.gevFit.gevSample.exog['scale'][t]
+            X_xi = self.gevFit.gevSample.exog['shape'][t]
             sigma_t = np.dot(X_sigma, params[i:i+j])
             xi_t = np.dot(X_xi, params[i+j:])
 
@@ -864,11 +908,10 @@ class GEVReturnLevel:
             d_zp_d_mu = 1
             d_zp_d_sigma = -(1 - temp) / xi_t
             d_zp_d_xi = (sigma_t / xi_t**2) * (1 - temp) - (sigma_t / xi_t) * temp * np.log(y_p)
-
         # Construct gradient vector
-        gradient = np.concatenate([d_zp_d_mu * X_mu, d_zp_d_sigma * X_sigma, d_zp_d_xi * X_xi])
+        gradient = np.concatenate([d_zp_d_mu * X_mu])
         # Estimate standard error using the delta method
-        variance = gradient @ self.gevFit.cov_matrix.todense() @ gradient.T
+        variance = gradient @ self.gevFit.cov_matrix.todense()[i:,i:] @ gradient.T
         std_error = np.sqrt(variance)
 
         if self.gevFit.fit_method.lower() == 'mle':
@@ -876,23 +919,26 @@ class GEVReturnLevel:
             z_crit = norm.ppf(1 - alpha / 2)
             ci_lower = z_p - z_crit * std_error
             ci_upper = z_p + z_crit * std_error
-            return z_p[0], (ci_lower[0], ci_upper[0])
+            return std_error, (ci_lower[0], ci_upper[0])
         else: 
             n = 1000
             profile_params = np.linspace(z_p - 2*std_error, z_p + 2*std_error, n)
         
 
-    def return_level_summary(self):
+    def summary(self):
         """
         Computes return levels and confidence intervals over multiple return periods and time steps.
         
+        Returns:
+            np.ndarray: Array of return level estimates and confidence intervals.
+            
         Raises:
-            ValueError: If T, t, or confidence is None, advising the user to call set_summary_parameters.
+            ValueError: If T, t, or confidence is None.
         """
         if self.T is None or self.t is None or self.confidence is None:
             raise ValueError(
                 "Return periods (T), time steps (t), or confidence level are not set. "
-                "Please call `set_summary_parameters(T, t, confidence)` before using `return_level_summary`."
+                "Please call `set_parameters(T, t, confidence)` before using `summary`."
             )
 
         len_T = len(self.T)
@@ -913,7 +959,7 @@ class GEVReturnLevel:
         return rlArray
         
 
-    def set_summary_parameters(self, confidence=None, t=None, T=None):
+    def set_parameters(self, confidence=None, t=None, T=None):
         """
         Sets the summary parameters for return level computations.
 
@@ -921,8 +967,6 @@ class GEVReturnLevel:
             confidence (float, optional): Confidence level for return level estimation.
             T (list or np.array, optional): Return period vector.
             t (list or np.array, optional): Time vector.
-
-        If all parameters are None, a warning is displayed suggesting the user set at least one parameter.
         """
         if confidence is not None:
             self.confidence = confidence
@@ -937,33 +981,48 @@ class GEVReturnLevel:
                 UserWarning
             )
 
-class GEVReturnLevel_reparam:
+    def __str__(self):
+        return(str(self.summary()))
+
+class GEVReturnLevel_reparam(GEVReturnLevelBase):
     def __init__(self, gevFit, t, confidence=0.95):
-        self.gevFit = gevFit
+        super().__init__(gevFit, confidence)
         self.t = t
-        self.confidence = confidence
 
     def return_level_at(self, t):
+        """
+        Computes the return level at a specific time point using the reparameterized approach.
+        
+        Args:
+            t (int): Reference time point.
+            
+        Returns:
+            tuple: First parameter estimate and confidence interval (lower, upper).
+        """
         if self.gevFit.fit_method.lower()=='mle':
             i,_,_ = self.gevFit.len_exog
             zp_cov_matrix = self.gevFit.cov_matrix.todense()[:i,:i]
-            X_zp_selected = self.gevFit.exog['location'][t]
+            X_zp_selected = self.gevFit.gevSample.exog['location'][t]
             se = np.sqrt(np.einsum('ij,jk,ik->i', X_zp_selected.reshape(-1,1), zp_cov_matrix, X_zp_selected.reshape(-1,1)))
-            print
             zp = np.einsum('i,i -> ',X_zp_selected,self.gevFit.fitted_params[:i])
             z_score = norm.ppf(0.975) 
-            lower_bound = zp- z_score * se
+            lower_bound = zp - z_score * se
             upper_bound = zp + z_score * se
             return self.gevFit.fitted_params[0], (lower_bound.item(),upper_bound.item())
         return 0
     
-    def return_level_summary(self):
+    def summary(self):
+        """
+        Computes return levels and confidence intervals over multiple time points.
+        
+        Returns:
+            np.ndarray: Array of return level estimates and confidence intervals.
+        """
         rlArray = np.empty((1, len(self.t), 5), dtype=np.float32)
-
         if self.gevFit.fit_method.lower() == 'mle':
-            i, _, _ = self.gevFit.len_exog
+            i, _, _ = self.gevFit.gevSample.len_exog
             zp_cov_matrix = self.gevFit.cov_matrix.todense()[:i, :i]
-            X_zp = self.gevFit.exog['location']  
+            X_zp = self.gevFit.gevSample.exog['location']  
 
             # Extract only the requested rows from X_zp
             X_zp_selected = X_zp[self.t]  
@@ -976,7 +1035,7 @@ class GEVReturnLevel_reparam:
             lower_bound = self.gevFit.fitted_params[0] - z_score * se
             upper_bound = self.gevFit.fitted_params[0] + z_score * se
             # Combine results into a final array
-            rlArray[0, :, 0] = self.gevFit.rl_info[1]*np.ones(len(self.t))
+            rlArray[0, :, 0] = self.gevFit.RL_args.get('T',None)*np.ones(len(self.t))
             rlArray[0, :, 1] = self.t  
             rlArray[0, :, 2] = se
             rlArray[0, :, 3] = lower_bound
@@ -984,8 +1043,10 @@ class GEVReturnLevel_reparam:
             return rlArray
 
         return 0
-
     
+    def __str__(self):
+        return(str(self.summary()))
+
 class GEV_WWA(GEV):
     def __init__(self, endog, exog=None, loc_link=None, scale_link=None, shape_link=None, **kwargs):
         super().__init__(endog, exog, loc_link, scale_link, shape_link, **kwargs)
@@ -1197,11 +1258,12 @@ if __name__ == "__main__":
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
     EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
+    EOBS["time"] = np.arange(len(EOBS))
     #n = len(EOBS["prmax"].values.reshape(-1,1))
     #
     # Dummy endog variable (10 samples)
-    
-    exog = {"location" : EOBS[["tempanomalyMean"]]}
+    # tempanomalyMean
+    exog = {"location" :EOBS[['time']]}
     #model = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog)
     #gev_result_1 = model.fit()
     #gev_result_1.probability_plot()
@@ -1210,12 +1272,13 @@ if __name__ == "__main__":
     #test = GEV_WWA_Likelihood(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
     #test.data_plot(time=EOBS["year"])
 
-    a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog, loc_return_level_reparam=True, T=100)
-    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_summary())
-    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_at(t=9))
-    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_at(t=10))
-    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_at(t=50))
-    print(a1.return_level(a1.fit(fit_method='mle'), t=[9,10,50,60]).return_level_at(t=60))
+    afit = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog,T=50).fit(fit_method="mle")
+    print(afit)
+    print(afit.return_level(t=[0,10,30,60,len(EOBS)-1]))
+    bfit = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit(fit_method="mle")
+    print(bfit)
+    print(bfit.return_level(T=[50], t=[0,10,30,60,len(EOBS)-1]))
+    #print(a.return_level(gevFit=a1,T=[500], t=[0,10,30,60,len(EOBS)-1]).return_level_summary())
     #a1 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1))
     #print(a1.len_exog)
 
