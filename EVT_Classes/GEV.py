@@ -72,7 +72,7 @@ class GEV(ABC):
         self.T = T
 
 
-    def nloglike(self, free_params, forced_indices=None, forced_param_values=None):
+    def nloglike(self, params, forced_indices=None, forced_param_values=None):
         """
         Computes the negative log-likelihood of the GEV model with support for multiple forced parameters.
         
@@ -89,53 +89,36 @@ class GEV(ABC):
         # Extract the number of covariates for each parameter
         #n, p = self.endog.shape
         i, j, _ = self.len_exog
-        params = np.zeros(self.nparams)
-        
-        # Handle the case of single forced parameter for backward compatibility
-        if isinstance(forced_indices, int) and forced_indices >= 0:
-            forced_indices = [forced_indices]
-            forced_param_values = [forced_param_values]
-        
-        # Initialize with default values if not provided
-        if forced_indices is None or forced_param_values is None:
-            forced_indices = []
-            forced_param_values = []
-        
-        # Check lengths match
-        if len(forced_indices) != len(forced_param_values):
-            raise ValueError("forced_indices and forced_param_values must have the same length")
-        
-        # Convert to sets for O(1) lookup
-        forced_dict = dict(zip(forced_indices, forced_param_values))
-        
-        # Fill the params array with forced and free parameters
-        free_idx = 0
-        for k in range(self.nparams):
-            if k in forced_dict:
-                params[k] = forced_dict[k]  # Use fixed parameter value
-            else:
-                params[k] = free_params[free_idx]  # Use optimized parameter
-                free_idx += 1
 
         # Compute scale and shape for each series
         scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], params[i:i+j]))
         shape = self.shape_link(np.einsum('nkp,k->np', self.exog['shape'], params[i+j:] ))
 
-            # Compute location, handling return level reparameterization
         if self.loc_return_level_reparam:
-             # Additional shape bounds check
+            # Safety checks for invalid values
             if np.any(scale <= 0):
-                return 1e6
+                return 1e9
 
             zp = self.loc_link(np.einsum('nip,i->np', self.exog['location'], params[0:i]))
+
+            # Check for finite and realistic zp values
+            if np.any(~np.isfinite(zp)):
+                return 1e9
+
             y_p = -np.log(1 - 1 / self.T)
-            location = np.where(
-                np.isclose(shape, 0),
-                zp + scale * np.log(y_p),
-                zp + (scale / shape) * (1 - y_p ** (-shape))
-            )
+
+            # Safe computation of location
+            with np.errstate(divide='ignore', invalid='ignore'):
+                location = np.where(
+                    np.isclose(shape, 0),
+                    zp + scale * np.log(y_p),
+                    zp + (scale / shape) * (1 - y_p ** (-shape))
+                )
+
+            # Final safety check for unrealistic location values
+            if np.any(~np.isfinite(location)):
+                return 1e9
         else:
-            # Standard location computation
             location = self.loc_link(np.einsum('nip,i->np', self.exog['location'], params[0:i]))
 
         # GEV transformation
@@ -146,11 +129,11 @@ class GEV(ABC):
         # Check for invalid values
         if np.any(scale <= 0) or np.any((~is_gumbel) & (transformed_data <= 0)):
             return 1e6
-
+        
     # Compute per-observation negative log-likelihood terms
         n_ll_terms = np.where(
             is_gumbel,
-            # Gumbel case
+            # Gumbel cases
             np.log(scale) + normalized_data + np.exp(-normalized_data),
             # General GEV case
             np.log(scale) + transformed_data ** (-1 / shape) + (1 + 1 / shape) * np.log(transformed_data)
@@ -189,7 +172,7 @@ class GEVSample(GEV):
         ----------
         endog : array-like
             Endogenous variable. Can be a list, NumPy array, Pandas Series, or any array-like object.
-            Can have shape (n,m) where n is the number of observations and m is the number of variables.
+            Can have shape (n,m) where n is the number of observations and m is the number of variables.M
         exog : array-like or dict, optional
             Exogenous variables for parameters. Can be:
             - A list, NumPy array, or Pandas DataFrame to be used for all parameters
@@ -278,8 +261,13 @@ class GEVSample(GEV):
             endog_var = np.var(endog)
             
         self.scale_guess = np.sqrt(6 * endog_var) / np.pi
-        self.location_guess = endog_mean - 0.57722 * self.scale_guess
         self.shape_guess = 0.1
+
+        if self.T is not None:
+            y_p = -np.log(1 - 1 / self.T)
+            self.location_guess = endog_mean - (self.scale_guess / self.shape_guess) * (1 - y_p ** (-self.shape_guess))
+        else:
+            self.location_guess = endog_mean - 0.57722 * self.scale_guess
 
         ##3 : Internal attributes
         self._forced_param_index = -1
@@ -377,6 +365,10 @@ class GEVSample(GEV):
                 
             self.exog = {param: self._validate_and_process_exog_array(param_exog_array, param) for param in param_names}  
 
+        if all(np.array_equal(self.exog[key], np.ones((self.n_obs, 1, self.n_samples))) for key in param_names):
+            self.trans = False
+        else:
+            self.trans = True
         self.len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1])
         self.nparams = sum(self.len_exog)
 
@@ -507,6 +499,7 @@ class GEVSample(GEV):
             case "mle":
                 return self._fit_mle(start_params, optim_method, RL_args)
             case "profile":
+                print("oh")
                 return self._fit_profile(start_params, optim_method, RL_args)
             case _:
                 raise ValueError("Unsupported fit method. Choose 'MLE' or 'Profile'.")
@@ -524,6 +517,8 @@ class GEVSample(GEV):
         
         self.result = minimize(self.nloglike, start_params, method=optim_method)
         hessian_func = nd.Hessian(self.nloglike)
+        #print(self.result.x)
+        #print(hessian_func(self.result.x))
         cov_matrix = np.linalg.inv(hessian_func(self.result.x))
         fitted_loc = self.loc_link(np.einsum('nip,i->np', self.exog['location'], self.result.x[:i]))
         fitted_scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], self.result.x[i:i+j]))
@@ -542,7 +537,7 @@ class GEVSample(GEV):
 
     def _fit_profile(self, start_params, optim_method, RL_args,**kwargs):
         """Performs Profile Likelihood Estimation."""
-        n = 500
+        n = 10
         mle_model = self.fit(start_params, optim_method, fit_method='MLE')
         fitted_params = mle_model.fitted_params
         stds = np.sqrt(np.diag(mle_model.cov_matrix))
@@ -550,6 +545,7 @@ class GEVSample(GEV):
         all_param_values = np.empty((self.nparams, n))
         args = [(param_idx, n, optim_method, fitted_params,stds) for param_idx in range(self.nparams)]
         start_time = time.perf_counter()
+        print("oh")
         with ProcessPoolExecutor() as executor:
             for param_idx, profile_mles, param_values in executor.map(self._optimize_profile_parallel, args):
                 all_profile_mles[param_idx] = profile_mles
@@ -659,7 +655,7 @@ class GEVFit():
     def deviance(self):
         return 0
     
-    def return_level(self, T=None, t=None, confidence=0.95):
+    def return_level(self, T=None, t=None, s=None, confidence=0.95):
         """
         Returns an object that can be used to compute return levels lazily.
 
@@ -678,13 +674,15 @@ class GEVFit():
             return GEVReturnLevel_reparam(
                 gevFit=self,
                 t=t,
+                s=s,
                 confidence=confidence
             )
         else:
             return GEVReturnLevel(
                 gevFit=self,
-                t=t,
                 T=T,
+                t=t,
+                s=s,
                 confidence=confidence
             )
     
@@ -909,65 +907,82 @@ class GEVReturnLevelBase(ABC):
 
 
 class GEVReturnLevel(GEVReturnLevelBase):
-    def __init__(self, gevFit, T, t, confidence=0.95):
+    def __init__(self, gevFit, T, t, s, confidence=0.95):
         super().__init__(gevFit, confidence)
-        self.T = T  # User-specified time vector
-        self.t = t  # User-specified return periods
+        # Default for T: [5, 25, 100, 1000] if not specified
+        self.T = T if T is not None else [5, 25, 100, 1000]
+        
+        # Default for t: range from 0 to number of time steps (axis 0 of exog)
+        self.t = t if t is not None else [self.gevFit.gevSample.endog.shape[0]-1]
+        # Default for s: range from 0 to number of spatial points (axis 2 of exog)
+        self.s = s if s is not None else list(range(self.gevFit.gevSample.endog.shape[1]))
 
-    def return_level_at(self, T, t, confidence=0.95):
+    def return_level_at(self, T, t=0, s=0, confidence=0.95):
         """
         Computes the return level of the Generalized Extreme Value (GEV) distribution for a given return period T.
-        If method is set to "delta", the confidence interval is estimated using the delta method.
+        The confidence interval is estimated using the delta method.
 
         Args:
             T (float): Return period.
-            t (int, optional): Reference year for non-stationary models.
+            t (int, optional): Reference year for non-stationary models. Defaults to None.
+            s (int, optional): Series index (0-based, from 0 to p-1). Defaults to 1.
             confidence (float, optional): Confidence level for the interval. Defaults to 0.95.
 
         Returns:
-            tuple: Return level estimate and confidence interval (lower, upper).
+            tuple: (standard error, (lower_ci, upper_ci)) where lower_ci and upper_ci are the confidence interval bounds.
         """
+        # Validate return period
         if T <= 1:
             raise ValueError("Return period must be greater than 1.")
-        
-        if not self.gevFit.gevSample.trans:
+
+        # Get dimensions
+        n, p = self.gevFit.gevSample.endog.shape  # n: observations, p: series
+        if s < 0 or s >= p:
+            raise ValueError(f"Series index s must be between 0 and {p-1}, got {s}.")
+
+        # Get number of covariates for each parameter
+        i, j, k = self.gevFit.gevSample.len_exog  # i: location, j: scale, k: shape
+
+        # Extract fitted parameters
+        params = self.gevFit.fitted_params  # Shape: (i + j + k,)
+
+        # Determine effective time index
+        if not self.gevFit.gevSample.trans:  # Stationary model
+            t_eff = 0
             if t is not None:
                 warnings.warn(
-                    "Reference years are not required in a stationary model. Each year has the same return level for a given return period.",
+                    "Reference years are not required in a stationary model. Using t=0.",
                     UserWarning
                 )
-            loc, scale, shape = self.gevFit.gev_params[0][0], self.gevFit.gev_params[1][0], self.gevFit.gev_params[2][0]
-        else:
+        else:  # Non-stationary model
             if t is None:
-                raise ValueError(
-                    "A reference year must be provided in a non-stationary model since return levels vary over time for a given return period."
-                )
-            elif t >= self.gevFit.gevSample.n_obs:
-                raise ValueError(
-                    "You can not get the future return levels but only present or past return levels."
-                )
-            loc, scale, shape = self.gevFit.gev_params[0][t], self.gevFit.gev_params[1][t], self.gevFit.gev_params[2][t]
+                raise ValueError("A reference year must be provided in a non-stationary model.")
+            elif t >= n:
+                raise ValueError(f"t must be less than {n}, got {t}.")
+            t_eff = t
 
-        
-         # Compute the return level (Coles, 2001)
-        y_p = -np.log(1 - 1/T)
-        z_p = loc - scale * np.log(y_p) if shape == 0 or np.isclose(1/T, 0) else loc - (scale / shape) * (1 - y_p**(-shape))
+        # Extract covariates for series s at time t_eff
+        X_mu = self.gevFit.gevSample.exog['location'][t_eff, :, s]  # Shape: (i,)
+        X_sigma = self.gevFit.gevSample.exog['scale'][t_eff, :, s]  # Shape: (j,)
+        X_xi = self.gevFit.gevSample.exog['shape'][t_eff, :, s]     # Shape: (k,)
 
-        params = self.gevFit.fitted_params
+        # Compute GEV parameters (assuming identity link functions)
+        loc = np.dot(X_mu, params[:i])
+        scale = np.dot(X_sigma, params[i:i+j])
+        shape = np.dot(X_xi, params[i+j:])
 
-        if not self.gevFit.gevSample.trans:  # Stationary
-            _ , sigma_t, xi_t = params
-            X_mu = self.gevFit.gevSample.exog['location'][0]
-            X_sigma = self.gevFit.gevSample.exog['scale'][0]
-            X_xi =  self.gevFit.gevSample.exog['shape'][0]
-        else:  # Non-stationary
-            i, j, _ = self.gevFit.gevSample.len_exog
-            X_mu = self.gevFit.gevSample.exog['location'][t]
-            X_sigma = self.gevFit.gevSample.exog['scale'][t]
-            X_xi = self.gevFit.gevSample.exog['shape'][t]
-            sigma_t = np.dot(X_sigma, params[i:i+j])
-            xi_t = np.dot(X_xi, params[i+j:])
+        # Compute the return level (Coles, 2001)
+        y_p = -np.log(1 - 1 / T)
+        if np.isclose(shape, 0) or np.isclose(1 / T, 0):
+            z_p = loc - scale * np.log(y_p)
+        else:
+            z_p = loc - (scale / shape) * (1 - y_p ** (-shape))
 
+        # For gradient computation, use the linear predictors (identity link assumption)
+        sigma_t = np.dot(X_sigma, params[i:i+j])
+        xi_t = np.dot(X_xi, params[i+j:])
+
+        # Compute derivatives
         if np.isclose(xi_t, 0):
             d_zp_d_mu = 1
             d_zp_d_sigma = -np.log(y_p)
@@ -977,26 +992,29 @@ class GEVReturnLevel(GEVReturnLevelBase):
             d_zp_d_mu = 1
             d_zp_d_sigma = -(1 - temp) / xi_t
             d_zp_d_xi = (sigma_t / xi_t**2) * (1 - temp) - (sigma_t / xi_t) * temp * np.log(y_p)
-        # Construct gradient vector
-        gradient = np.concatenate([d_zp_d_mu * X_mu,d_zp_d_sigma*X_sigma,d_zp_d_xi*X_xi])
+
+        # Construct gradient vector with respect to fitted parameters
+        gradient = np.concatenate([d_zp_d_mu * X_mu, d_zp_d_sigma * X_sigma, d_zp_d_xi * X_xi])
+
         # Estimate standard error using the delta method
         variance = gradient @ self.gevFit.cov_matrix @ gradient.T
         std_error = np.sqrt(variance)
 
+        # Compute confidence interval
         alpha = 1 - confidence
         z_crit = norm.ppf(1 - alpha / 2)
         ci_lower = z_p - z_crit * std_error
         ci_upper = z_p + z_crit * std_error
-        return std_error, (ci_lower[0], ci_upper[0])
+
+        return z_p, (ci_lower, ci_upper)
   
         
-
     def summary(self):
         """
         Computes return levels and confidence intervals over multiple return periods and time steps.
         
         Returns:
-            np.ndarray: Array of return level estimates and confidence intervals.
+            tuple of np.ndarray: (z_p_array, ci_lower_array, ci_upper_array) each with shape (len_T, len_t, len_s)
             
         Raises:
             ValueError: If T, t, or confidence is None.
@@ -1004,26 +1022,36 @@ class GEVReturnLevel(GEVReturnLevelBase):
         if self.T is None or self.t is None or self.confidence is None:
             raise ValueError(
                 "Return periods (T), time steps (t), or confidence level are not set. "
-                "Please call `set_parameters(T, t, confidence)` before using `summary`."
+                "Please call set_parameters(T, t, confidence) before using summary."
             )
-        
-        len_T = len(self.T)
-        len_t = len(self.t)
-        rlArray = np.empty((len_T, len_t, 5), dtype=np.float16)
 
-        for i, T_val in enumerate(self.T):
-            for j, t_val in enumerate(self.t):
-                z_p, ci = self.return_level_at(
-                    T=T_val, t=t_val, confidence=self.confidence
-                )
-                rlArray[i, j, 2] = z_p    # Estimated return level
-                rlArray[i, j, 3] = ci[0]  # Lower confidence bound
-                rlArray[i, j, 4] = ci[1]  # Upper confidence 
-        
-        #print(self.T[:,None])
-        rlArray[:, :, 0] = self.T
-        rlArray[:, :, 1] = self.t
-        return rlArray
+        T = np.asarray(self.T, dtype=np.int32)
+        t = np.asarray(self.t, dtype=np.int32)
+        s = np.asarray(self.s, dtype=np.int32)
+
+        len_T = len(T)
+        len_t = len(t)
+        len_s = len(s)
+
+        # Step 1: Define a helper function for parallel computation
+        def compute_rl(T_val, t_val, s_val):
+            z_p, ci = self.return_level_at(T=T_val, t=t_val, s=s_val, confidence=self.confidence)
+            return z_p, ci[0], ci[1]
+
+        # Step 2: Compute return levels and CIs in parallel
+        results = Parallel(n_jobs=-1)(
+            delayed(compute_rl)(T_val, t_val, s_val)
+            for T_val in T for t_val in t for s_val in s
+        )
+
+        # Step 3: Reshape results and split into three arrays
+        results_array = np.array(results, dtype=np.float32).reshape(len_T, len_t, len_s, 3)
+
+        z_p_array = results_array[:, :, :, 0]
+        ci_lower_array = results_array[:, :, :, 1]
+        ci_upper_array = results_array[:, :, :, 2]
+
+        return z_p_array, ci_lower_array, ci_upper_array
         
 
     def set_parameters(self, confidence=None, t=None, T=None):
@@ -1052,11 +1080,12 @@ class GEVReturnLevel(GEVReturnLevelBase):
         return(str(self.summary()))
 
 class GEVReturnLevel_reparam(GEVReturnLevelBase):
-    def __init__(self, gevFit, t, confidence=0.95):
+    def __init__(self, gevFit, t, s, confidence=0.95):
         super().__init__(gevFit, confidence)
         self.t = t
+        self.s = s
 
-    def return_level_at(self, t):
+    def return_level_at(self, t , s, confidence):
         """
         Computes the return level at a specific time point using the reparameterized approach.
         
@@ -1066,44 +1095,61 @@ class GEVReturnLevel_reparam(GEVReturnLevelBase):
         Returns:
             tuple: First parameter estimate and confidence interval (lower, upper).
         """
-        i,_,_ = self.gevFit.len_exog
+        i,_,_ = self.gevFit.gevSample.len_exog
         zp_cov_matrix = self.gevFit.cov_matrix[:i,:i]
-        X_zp_selected = self.gevFit.gevSample.exog['location'][t]
-        se = np.sqrt(np.einsum('ij,jk,ik->i', X_zp_selected.reshape(-1,1), zp_cov_matrix, X_zp_selected.reshape(-1,1)))
+        X_zp_selected = self.gevFit.gevSample.exog['location'][t,:,s]
+        se = np.sqrt(np.einsum('i,ij,j->', X_zp_selected, zp_cov_matrix, X_zp_selected))
         zp = np.einsum('i,i -> ',X_zp_selected,self.gevFit.fitted_params[:i])
-        z_score = norm.ppf(0.975) 
+        z_score = norm.ppf(1-(1-confidence)/2)
         lower_bound = zp - z_score * se
         upper_bound = zp + z_score * se
         return se, (lower_bound.item(),upper_bound.item())
     
     def summary(self):
         """
-        Computes return levels and confidence intervals over multiple time points.
+        Computes return levels and confidence intervals over multiple time points and locations.
         
         Returns:
             np.ndarray: Array of return level estimates and confidence intervals.
         """
-        rlArray = np.empty((1, len(self.t), 5), dtype=np.float32)
-        i, _, _ = self.gevFit.gevSample.len_exog
-        zp_cov_matrix = self.gevFit.cov_matrix[:i, :i]
-        X_zp = self.gevFit.gevSample.exog['location']  
+        if self.t is None or self.s is None or self.confidence is None:
+            raise ValueError(
+                "Return period (T), time indices (t), series indices (s), or confidence level are not set. "
+                "Please ensure these are defined before using `summary`."
+        )
 
-        # Extract only the requested rows from X_zp
-        X_zp_selected = X_zp[self.t]  
+        # Convert to NumPy arrays for easy indexing
+        t = np.asarray(self.t)  # time indices
+        s = np.asarray(self.s)  # series indices
 
-        # Compute standard errors efficiently using batch multiplication
-        se = np.sqrt(np.einsum('ij,jk,ik->i', X_zp_selected, zp_cov_matrix, X_zp_selected))
-        zp = np.einsum('ij,j -> i',X_zp_selected,self.gevFit.fitted_params[:i])
-        # Compute confidence interval bounds
-        z_score = norm.ppf(0.975)  # 95% CI
-        lower_bound = self.gevFit.fitted_params[0] - z_score * se
-        upper_bound = self.gevFit.fitted_params[0] + z_score * se
-        # Combine results into a final array
-        rlArray[0, :, 0] = self.gevFit.RL_args.get('T',None)*np.ones(len(self.t))
-        rlArray[0, :, 1] = self.t  
-        rlArray[0, :, 2] = se
-        rlArray[0, :, 3] = lower_bound
-        rlArray[0, :, 4] = upper_bound
+        len_t = len(t)
+        len_s = len(s)
+
+        # Prepare output array: shape (1, len_t, len_s, 6)
+        rlArray = np.empty((1, len_t, len_s, 6), dtype=np.float32)
+
+        # Step 1: Fill in T, t, s columns
+        # Dimension 0 is fixed = 1; broadcast T, t, s into the correct slices
+        rlArray[0, :, :, 0] = self.gevFit.RL_args["T"]
+        rlArray[0, :, :, 1] = t[:, np.newaxis]
+        rlArray[0, :, :, 2] = s[np.newaxis, :]
+
+    # Step 2: Define a helper function for parallel (or serial) computation
+        def compute_one(t_val, s_val):
+            z_p, (ci_low, ci_up) = self.return_level_at(t_val, s_val, confidence=self.confidence)
+            return (z_p, ci_low, ci_up)
+
+    # Step 3: Compute return levels over all (t, s) combinations
+        results = Parallel(n_jobs=-1)(
+        delayed(compute_one)(t_val, s_val)
+        for t_val in t for s_val in s)
+
+        results_array = np.array(results, dtype=np.float32).reshape(len_t, len_s, 3)
+
+        rlArray[0, :, :, 3] = results_array[:, :, 0]  # z_p
+        rlArray[0, :, :, 4] = results_array[:, :, 1]  # lower
+        rlArray[0, :, :, 5] = results_array[:, :, 2]  # upper
+
         return rlArray
         
     
@@ -1329,62 +1375,14 @@ if __name__ == "__main__":
     # Dummy endog variable (10 samples)
     # tempanomalyMean
 
+
    # Original single-series endog
     endog = EOBS[["prmax"]]  # Shape: (n, 1)
     exog = {"location": EOBS[['tempanomalyMean']]}
 
-    # Extract the base prmax data
-    base_prmax = endog.values  # Shape: (n, 1)
-    n = base_prmax.shape[0]
-    p = 100  # Number of series
-
-    # Initialize array for 10 series
-    endog_data = np.zeros((n, p))
-
-    # For each series, create a slightly modified version of prmax
-    for s in range(p):
-        # Add small random noise to avoid collinearity (e.g., scale of 0.1)
-        noise = np.random.normal(0, 0.01, n)
-        prmax_modified = base_prmax[:, 0] + noise  # Shape: (n,)
-        
-        # Ensure positive values (since prmax is likely precipitation, can't be negative)
-        prmax_modified = np.maximum(prmax_modified, 0)
-        
-        # Assign to endog_data
-        endog_data[:, s] = prmax_modified
-
-    # Create the new endog array
-    endog10 = endog_data  # Shape: (n, 10)
-
-    # Extract the base tempanomalyMean data
-    base_temp = exog["location"].values  # Shape: (n, 1)
-    n = base_temp.shape[0]
-    p = 100  # Number of series
-    i = 1   # Number of covariates initially (tempanomalyMean only)
-
-    # Initialize array for 10 series with 1 covariate each
-    exog_data = np.zeros((n, i, p))
-
-    # For each series, create a slightly modified version of tempanomalyMean
-    for s in range(p):
-        # Add small random noise to avoid collinearity (e.g., scale of 0.1)
-        noise = np.random.normal(0, 0.1, n)
-        temp_modified = base_temp[:, 0] + noise  # Shape: (n,)
-        exog_data[:, 0, s] = temp_modified       # Assign modified temp
-
-    # Create the new exog dictionary
-    exog10 = {
-        "location": exog_data,  # Shape: (n, 1, 10)
-        "scale": None,    # Shape: (n, 1, 10)
-        "shape": None     # Shape: (n, 1, 10)
-    }
-
-
-    afit = GEVSample(endog=endog10,exog=exog10)
-    print(afit.endog.shape)
-    print(afit.exog["location"].shape)
-    print(afit.nloglike(free_params=[66,8,12,0.1]))
-    print(afit.fit(fit_method='profile'))
+    afit = GEVSample(endog=EOBS["prmax"],exog=exog)
+    rfit = afit.fit(fit_method='mle')
+    print(rfit)
     #print(afit.return_level(T=[1000], t=[0,25,30,35,len(EOBS)-1]))
     # = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog,T=50).fit(fit_method="mle")
     #print(afit)
