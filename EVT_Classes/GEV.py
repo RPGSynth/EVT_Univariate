@@ -92,18 +92,18 @@ class GEV(ABC):
 
         # Compute scale and shape for each series
         scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], params[i:i+j]))
+        #print(f"1 SCALE IS [{scale[0][0]}]")
+        if np.any(scale <= 0):
+            return 1e6 # Early exit for invalid scale
         shape = self.shape_link(np.einsum('nkp,k->np', self.exog['shape'], params[i+j:] ))
+        #print(f"2 SHAPE IS [{shape[0][0]}]")
 
         if self.loc_return_level_reparam:
-            # Safety checks for invalid values
-            if np.any(scale <= 0):
-                return 1e9
-
             zp = self.loc_link(np.einsum('nip,i->np', self.exog['location'], params[0:i]))
 
             # Check for finite and realistic zp values
             if np.any(~np.isfinite(zp)):
-                return 1e9
+                return 1e6
 
             y_p = -np.log(1 - 1 / self.T)
 
@@ -117,13 +117,16 @@ class GEV(ABC):
 
             # Final safety check for unrealistic location values
             if np.any(~np.isfinite(location)):
-                return 1e9
+                return 1e6
         else:
             location = self.loc_link(np.einsum('nip,i->np', self.exog['location'], params[0:i]))
-
+            #(f"3 LOCATION IS [{location[0][0]}]")
+            #print("--------------------------------------")
         # GEV transformation
         normalized_data = (self.endog - location) / scale  # Shape: (n, p)
-        transformed_data = 1 + shape * normalized_data      # Shape: (n, p)
+        #print(f"3 NORMALIZED IS [{location[0][0]}]")
+        transformed_data = 1 + shape * normalized_data 
+        #print(f"3 TRANSFORMED IS [{location[0][0]}]")     # Shape: (n, p)
         is_gumbel = np.isclose(shape, 0)                    # Shape: (n, p)
 
         # Check for invalid values
@@ -139,9 +142,13 @@ class GEV(ABC):
             np.log(scale) + transformed_data ** (-1 / shape) + (1 + 1 / shape) * np.log(transformed_data)
         )
 
+        if not np.all(np.isfinite(n_ll_terms)):
+            # Catches Inf/-Inf/NaN resulting from exp/log/pow issues
+            return 1e6
+
         # Total negative log-likelihood
-        n_ll = np.sum(n_ll_terms)
-        return n_ll
+        #print(np.sum(n_ll_terms))
+        return np.sum(n_ll_terms)
 
     def loglike(self,params):
         return -(self.nloglike(params))
@@ -224,7 +231,7 @@ class GEVSample(GEV):
                 
         except Exception as e:
             raise TypeError(f"Could not convert endogenous data to a numeric array: {str(e)}")
-
+        
 
         ## 3 : The elements of endog are not Nan.
         if np.isnan(self.endog).any():
@@ -247,6 +254,7 @@ class GEVSample(GEV):
         
 
         ## 2 : Data and fit attributes
+        self.N_total = self.endog.size
         self.n_obs = len(self.endog)
         self.n_samples = self.endog.shape[1]  # Store the number of features
         self.result = None
@@ -516,11 +524,46 @@ class GEVSample(GEV):
             )
         
         self.result = minimize(self.nloglike, start_params, method=optim_method)
-        hessian_func = nd.Hessian(self.nloglike)
-        #print(self.result.x)
-        #print(hessian_func(self.result.x))
-        print(hessian_func(self.result.x))
-        cov_matrix = np.linalg.inv(hessian_func(self.result.x)*100)
+        # Handle failure case: maybe return NaNs or raise error
+        if not self.result.success:
+            raise ValueError(f"Optim issues can often stem from bad automatic starting parameters.\n"
+              f"  Suggestion: Verify your `start_params` and/or provide manual initial guesses (especially intercepts) in the start_params attribute of the fit method.", RuntimeWarning)
+
+        mle_params = self.result.x
+        cov_matrix = np.full((self.nparams, self.nparams), np.nan, dtype=np.float64)
+        hessian_func = nd.Hessian(self.nloglike) # Assumes nloglike takes/returns float64 compatible values
+
+        try:
+            # 1. Attempt calculation with numdifftools
+            hess_avg = hessian_func(mle_params) # Calculate Hessian of average NLL
+
+            # 2. Attempt inversion
+            inv_hess_avg = np.linalg.inv(hess_avg)
+
+            # 3. Attempt scaling
+            if self.N_total <= 0:
+                raise ValueError("N_total is zero or negative, cannot scale Hessian.")
+            cov_matrix_nd = inv_hess_avg
+
+            # 4. Validate the result
+            diag_cov_nd = np.diag(cov_matrix_nd)
+            if np.any(diag_cov_nd <= 0) or not np.all(np.isfinite(cov_matrix_nd)):
+                raise ValueError("numdifftools covariance matrix invalid (e.g., non-positive variance).")
+
+            # 5. Success: Assign the numdifftools result
+            cov_matrix = cov_matrix_nd
+
+        except (np.linalg.LinAlgError, ValueError, TypeError, RuntimeError) as e_nd:
+            # Catch calculation, inversion, or validation errors from numdifftools path
+            warnings.warn(f"numdifftools Hessian calculation/inversion failed: {e_nd}.\n"
+              f"  Hessian issues after optimization can often stem from convergence to a problematic parameter region, potentially due to the automatic starting parameters.\n"
+              f"  Suggestion: Verify your `start_params` or provide manual initial guesses (especially intercepts) in the start_params attribute of the fit method.", RuntimeWarning)
+
+        # Catch any other unexpected exceptions during the whole process
+        except Exception as e_other:
+            warnings.warn(f"Unexpected error during Hessian/Covariance calculation: {e_other}", RuntimeWarning)
+            # cov_matrix remains NaN from initialization
+
         fitted_loc = self.loc_link(np.einsum('nip,i->np', self.exog['location'], self.result.x[:i]))
         fitted_scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], self.result.x[i:i+j]))
         fitted_shape = self.shape_link(np.einsum('nkp,k->np', self.exog['shape'], self.result.x[i+j:]))
@@ -633,14 +676,15 @@ class GEVFit():
             self.fit_method = fit_method
             self.RL_args = RL_args
     def AIC(self):
+        print(self.gevSample.N_total)
         if self.fit_method.lower() != 'mle':
             warnings.warn(f"AIC is based on MLE estimation, not on '{self.fit_method}'.", UserWarning)
-        return 2 * self.gevSample.nparams + 2 * self.n_ll
+        return 2 * self.gevSample.nparams + 2 * (self.n_ll*1)
 
     def BIC(self):
         if self.fit_method.lower() != 'mle':
             warnings.warn(f"BIC is based on MLE estimation, not on '{self.fit_method}'.", UserWarning)
-        return self.gevSample.nparams * np.log(self.gevSample.n_obs) + 2 * self.n_ll
+        return self.gevSample.nparams * np.log(self.gevSample.n_obs) + 2 * (self.n_ll*1)
 
     def SE(self):
         # Compute standard errors using the inverse Hessian matrix
@@ -1382,6 +1426,8 @@ if __name__ == "__main__":
     exog = {"location": EOBS[['tempanomalyMean']]}
 
     afit = GEVSample(endog=EOBS["prmax"],exog=exog)
+    print(afit.endog.shape)
+    print(afit.exog["location"].shape)
     rfit = afit.fit(fit_method='mle')
     print(rfit)
     #print(afit.return_level(T=[1000], t=[0,25,30,35,len(EOBS)-1]))
