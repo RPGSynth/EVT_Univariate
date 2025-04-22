@@ -5,10 +5,9 @@ import warnings
 # Third-party library imports
 import numpy as np
 import pandas as pd
-import xarray as xr
+import xarray as xrs
 import numdifftools as nd
-import statsmodels.api as sm
-import plotly.graph_objects as go
+import statsmodels.api as sms
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 from scipy.optimize import minimize, approx_fprime
@@ -1410,11 +1409,11 @@ class GEV_WWA_Fit(GEVFit):
 
 
     
-if __name__ == "__main__":
-    EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
+#if __name__ == "__main__":
+    #EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
-    EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
-    EOBS["time"] = np.arange(len(EOBS))
+    #EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
+    #EOBS["time"] = np.arange(len(EOBS))
     #n = len(EOBS["prmax"].values.reshape(-1,1))
     #
     # Dummy endog variable (10 samples)
@@ -1422,14 +1421,14 @@ if __name__ == "__main__":
 
 
    # Original single-series endog
-    endog = EOBS[["prmax"]]  # Shape: (n, 1)
-    exog = {"location": EOBS[['tempanomalyMean']]}
+    #endog = EOBS[["prmax"]]  # Shape: (n, 1)
+    #exog = {"location": EOBS[['tempanomalyMean']]}
 
-    afit = GEVSample(endog=EOBS["prmax"],exog=exog)
-    print(afit.endog.shape)
-    print(afit.exog["location"].shape)
-    rfit = afit.fit(fit_method='mle')
-    print(rfit)
+    #afit = GEVSample(endog=EOBS["prmax"],exog=exog)
+    #print(afit.endog.shape)
+    #print(afit.exog["location"].shape)
+    #rfit = afit.fit(fit_method='mle')
+    #print(rfit)
     #print(afit.return_level(T=[1000], t=[0,25,30,35,len(EOBS)-1]))
     # = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog,T=50).fit(fit_method="mle")
     #print(afit)
