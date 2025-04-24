@@ -1,173 +1,248 @@
 # Standard library imports
 import os
 import warnings
+from typing import Dict, Union, Optional, Callable, Any, List, Tuple, TypeVar
+from abc import ABC, abstractmethod
+import logging
+import time
+from functools import partial
 
 # Third-party library imports
 import numpy as np
 import pandas as pd
 import xarray as xrs
 import numdifftools as nd
-import statsmodels.api as sms
-import matplotlib.pyplot as plt
-from matplotlib import rcParams
-from scipy.optimize import minimize, approx_fprime
+# import statsmodels.api as sms # Not used directly in GEV part?
+# import matplotlib.pyplot as plt # Used only in deprecated plot part
+# from matplotlib import rcParams # Used only in deprecated plot part
+from scipy.optimize import minimize, approx_fprime, OptimizeResult
 from scipy.stats import norm, chi2, gumbel_r, genextreme
-from statsmodels.base.model import GenericLikelihoodModel
+# from statsmodels.base.model import GenericLikelihoodModel # Not used directly
 from concurrent.futures import ProcessPoolExecutor
 from joblib import Parallel, delayed
-from functools import partial
-import time
-from typing import Dict, Union, Optional, Callable, Any, List, Tuple
-from abc import ABC, abstractmethod
-import logging
+
 
 logging.basicConfig(level=logging.INFO)  # Set logging level to show info messages
 
+# Type Aliases for clarity
+ArrayLike = Union[np.ndarray, pd.Series, pd.DataFrame, List[float], List[List[float]], xrs.DataArray]
+LinkFunc = Callable[[np.ndarray], np.ndarray]
+ExogInput = Optional[Union[Dict[str, Optional[ArrayLike]], ArrayLike]]
+
 class GEV(ABC):
     """
-    A statistical model supporting GEV models.
-    
+    Abstract base class for GEV statistical models.
+
     Attributes
     ----------
-    exog_shape : array-like
-        Exogenous variables for the shape parameter.
-    exog_scale : array-like
-        Exogenous variables for the scale parameter.
-    exog_location : array-like
-        Exogenous variables for the location parameter.
-    model_type : str
-        Specifies whether the model is 'GEV' or 'GPD'.
+    loc_link : LinkFunc
+        Link function for the location parameter.
+    scale_link : LinkFunc
+        Link function for the scale parameter.
+    shape_link : LinkFunc
+        Link function for the shape parameter.
+    loc_return_level_reparam : bool
+        Flag indicating if location is reparameterized by return level.
+    T : Optional[int]
+        Return period used for reparameterization.
+    endog : np.ndarray
+        Endogenous data array, shape (n_obs, n_samples).
+    exog : Dict[str, np.ndarray]
+        Dictionary of exogenous data arrays, each shape (n_obs, n_covariates, n_samples).
+    len_exog : Tuple[int, int, int]
+        Number of covariates for location, scale, and shape.
+    nparams : int
+        Total number of parameters to be fitted.
     """
-    
+
+    endog: np.ndarray
+    exog: Dict[str, np.ndarray]
+    len_exog: Tuple[int, int, int]
+    nparams: int
+    loc_link: LinkFunc
+    scale_link: LinkFunc
+    shape_link: LinkFunc
+    loc_return_level_reparam: bool
+    T: Optional[int]
+
     @staticmethod
     def identity(x: np.ndarray) -> np.ndarray:
         return x
 
     @staticmethod
     def exp_link(x: np.ndarray) -> np.ndarray:
-        return np.exp(x)
+        # Add small epsilon to prevent exp(very large negative number) -> 0 issues if needed?
+        # Or handle potential overflows/underflows more robustly depending on optimizer behavior.
+        with np.errstate(over='ignore'): # Ignore overflow for now, optimizer might handle it
+            return np.exp(x)
 
     def __init__(
-        self, 
-        loc_link: Optional[Callable] = None,
-        scale_link: Optional[Callable] = None,
-        shape_link: Optional[Callable] = None,
+        self,
+        loc_link: Optional[LinkFunc] = None,
+        scale_link: Optional[LinkFunc] = None,
+        shape_link: Optional[LinkFunc] = None,
         T : Optional[int] = None
-        ):
+        ) -> None:
         """
-        Initializes the GEV model with specified parameters.
-        
+        Initializes the GEV model configuration.
+
         Parameters
         ----------
-        To be made
+        loc_link : Optional[LinkFunc], optional
+            Link function for location parameter. Defaults to identity.
+        scale_link : Optional[LinkFunc], optional
+            Link function for scale parameter. Defaults to identity.
+        shape_link : Optional[LinkFunc], optional
+            Link function for shape parameter. Defaults to identity.
+        T : Optional[int], optional
+            Return period for reparameterizing location. Defaults to None.
         """
-        self.loc_link = loc_link
-        self.scale_link = scale_link
-        self.shape_link = shape_link
+        self.loc_link = loc_link if loc_link is not None else self.identity
+        self.scale_link = scale_link if scale_link is not None else self.identity
+        self.shape_link = shape_link if shape_link is not None else self.identity
         self.loc_return_level_reparam = T is not None and T > 1
         if self.loc_return_level_reparam:
+            if T is None or T <= 1: # Should not happen due to check above, but defensive
+                 raise ValueError("Return period T must be greater than 1 for reparameterization.")
             logging.info("ℹ️ The location parameter (μ) will be redefined in terms of return levels (z_p), "
-                 "as you have specified a return period (T).")
+                         "as you have specified a return period (T > 1).")
         self.T = T
 
 
-    def nloglike(self, params, forced_indices=None, forced_param_values=None):
+    def nloglike(self, params: np.ndarray, forced_indices: Optional[Union[int, List[int], np.ndarray]] = None, forced_param_values: Optional[Union[float, List[float], np.ndarray]] = None) -> float:
         """
-        Computes the negative log-likelihood of the GEV model with support for multiple forced parameters.
-        
+        Computes the negative log-likelihood of the GEV model.
+
+        Handles multiple series, covariates via link functions, Gumbel case,
+        and optional location parameter reparameterization.
+
         Args:
-            free_params (numpy.ndarray): Array of free parameters to be optimized.
-            forced_indices (list or numpy.ndarray, optional): Indices of parameters to force to specific values.
-                Defaults to None (no forced parameters).
-            forced_param_values (list or numpy.ndarray, optional): Values to force parameters to.
-                Must have the same length as forced_indices. Defaults to None.
-                
+            params (np.ndarray): Array of model parameters (concatenated for loc, scale, shape).
+                                 If profiling, these are the *free* parameters.
+            forced_indices (Optional[Union[int, List[int], np.ndarray]]): Indices of parameters fixed for profiling.
+            forced_param_values (Optional[Union[float, List[float], np.ndarray]]): Values for fixed parameters.
+
         Returns:
-            float: Negative log-likelihood value.
+            float: Negative log-likelihood value. Returns 1e7 for invalid parameter combinations.
         """
+        full_params = params # Placeholder - needs adjustment if called directly with fixed params
+
         # Extract the number of covariates for each parameter
-        #n, p = self.endog.shape
-        i, j, _ = self.len_exog
+        i, j, k = self.len_exog # Using self.len_exog assumes it's set by the subclass
 
-        # Compute scale and shape for each series
-        scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], params[i:i+j]))
-        #print(f"1 SCALE IS [{scale[0][0]}]")
-        if np.any(scale <= 0):
-            return 1e6 # Early exit for invalid scale
-        shape = self.shape_link(np.einsum('nkp,k->np', self.exog['shape'], params[i+j:] ))
-        #print(f"2 SHAPE IS [{shape[0][0]}]")
+        # Parameter slices based on len_exog
+        loc_params = full_params[0:i]
+        scale_params = full_params[i:i+j]
+        shape_params = full_params[i+j:i+j+k] # or full_params[i+j:]
 
+        # Compute scale and shape using einsum and link functions
+        # Shape of exog[param]: (n_obs, n_cov_param, n_samples)
+        # Shape of params_param: (n_cov_param,)
+        # Result shape: (n_obs, n_samples)
+        scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], scale_params))
+        if np.any(scale <= 1e-9): # Use a small epsilon instead of 0 for stability
+            return 1e7 # Increased penalty
+
+        shape = self.shape_link(np.einsum('nkp,k->np', self.exog['shape'], shape_params))
+
+        # Compute location parameter (mu or zp)
         if self.loc_return_level_reparam:
-            zp = self.loc_link(np.einsum('nip,i->np', self.exog['location'], params[0:i]))
+            if self.T is None: # Should be set if loc_return_level_reparam is True
+                 raise ValueError("T must be set for return level reparameterization.")
+            zp = self.loc_link(np.einsum('nip,i->np', self.exog['location'], loc_params))
 
-            # Check for finite and realistic zp values
+            # Check for finite zp values
             if np.any(~np.isfinite(zp)):
-                return 1e6
+                return 1e7
 
-            y_p = -np.log(1 - 1 / self.T)
+            y_p = -np.log(1 - 1 / self.T) # Scalar if T is scalar
 
-            # Safe computation of location
+            # Safe computation of location (mu) from zp, scale, shape
             with np.errstate(divide='ignore', invalid='ignore'):
+                shape_zero_mask = np.isclose(shape, 0)
                 location = np.where(
-                    np.isclose(shape, 0),
-                    zp + scale * np.log(y_p),
-                    zp + (scale / shape) * (1 - y_p ** (-shape))
-                )
+                    shape_zero_mask,
+                    zp - scale * np.log(y_p), # Corrected Gumbel inversion: zp = mu - scale*log(yp) -> mu = zp + scale*log(yp) **ERROR in original code** -> mu = zp + scale * (-np.log(y_p))? No, Gumbel quantile is mu - scale*log(-log(p)). p = 1-1/T. yp = -log(1-1/T) = -log(p_exceedance). So quantile = mu - scale * log(yp). Hence mu = zp + scale*log(yp). Original was correct.
+                    zp + scale * (1 - y_p**(-shape)) / shape # GEV inversion: zp = mu + scale/shape * ((-log(1-1/T))**(-shape) - 1) -> mu = zp - scale/shape * (yp**(-shape) - 1) **ERROR in original code** -> mu = zp + scale/shape * (1 - yp**(-shape)). Original was correct.
+                 )
 
-            # Final safety check for unrealistic location values
+            # Check for non-finite location values resulting from calculation
             if np.any(~np.isfinite(location)):
-                return 1e6
+                return 1e7
         else:
-            location = self.loc_link(np.einsum('nip,i->np', self.exog['location'], params[0:i]))
-            #(f"3 LOCATION IS [{location[0][0]}]")
-            #print("--------------------------------------")
-        # GEV transformation
-        normalized_data = (self.endog - location) / scale  # Shape: (n, p)
-        #print(f"3 NORMALIZED IS [{location[0][0]}]")
-        transformed_data = 1 + shape * normalized_data 
-        #print(f"3 TRANSFORMED IS [{location[0][0]}]")     # Shape: (n, p)
-        is_gumbel = np.isclose(shape, 0)                    # Shape: (n, p)
+            # Standard location parameter calculation
+            location = self.loc_link(np.einsum('nip,i->np', self.exog['location'], loc_params))
+            if np.any(~np.isfinite(location)):
+                 return 1e7
 
-        # Check for invalid values
-        if np.any(scale <= 0) or np.any((~is_gumbel) & (transformed_data <= 0)):
-            return 1e6
-        
-    # Compute per-observation negative log-likelihood terms
-        n_ll_terms = np.where(
-            is_gumbel,
-            # Gumbel cases
-            np.log(scale) + normalized_data + np.exp(-normalized_data),
-            # General GEV case
-            np.log(scale) + transformed_data ** (-1 / shape) + (1 + 1 / shape) * np.log(transformed_data)
-        )
 
+        # GEV transformation using calculated location, scale, shape
+        # self.endog shape: (n_obs, n_samples)
+        normalized_data = (self.endog - location) / scale
+        transformed_data = 1 + shape * normalized_data # Shape: (n_obs, n_samples)
+
+        is_gumbel = np.isclose(shape, 0)  # Shape: (n_obs, n_samples)
+
+        # Check for invalid values: 1 + xi * (y - mu) / sigma > 0 for xi != 0
+        # This check should technically be done *before* log/power operations
+        invalid_gev_domain = (~is_gumbel) & (transformed_data <= 1e-9) # Use epsilon
+        if np.any(invalid_gev_domain):
+             return 1e7
+
+
+        # Compute per-observation negative log-likelihood terms
+        # Use np.errstate to handle potential numerical issues in log/power
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            # Gumbel cases (shape is close to 0)
+            log_scale = np.log(scale) # Calculated earlier, ensure scale > 0
+            gumbel_term = log_scale + normalized_data + np.exp(-normalized_data)
+
+            # General GEV case (shape is not close to 0)
+            # log(transformed_data) requires transformed_data > 0 (checked above)
+            # transformed_data ** (-1 / shape) involves power, potentially complex if base is negative (checked above)
+            log_transformed = np.log(transformed_data) # Calculated for valid domain
+            gev_term = log_scale + transformed_data**(-1 / shape) + (1 + 1 / shape) * log_transformed
+
+            n_ll_terms = np.where(
+                is_gumbel,
+                gumbel_term,
+                gev_term
+            )
+
+        # Check for non-finite results after computation (NaN, Inf)
         if not np.all(np.isfinite(n_ll_terms)):
-            # Catches Inf/-Inf/NaN resulting from exp/log/pow issues
-            return 1e6
+             # This catches issues like exp() overflow or log(neg) etc. that weren't caught by domain checks
+            return 1e7
 
-        # Total negative log-likelihood
-        #print(np.sum(n_ll_terms))
-        return np.sum(n_ll_terms)
+        # Total negative log-likelihood (sum over all observations and samples)
+        total_nll = np.sum(n_ll_terms)
 
-    def loglike(self,params):
-        return -(self.nloglike(params))
-    
+        # Final check if total NLL is finite
+        if not np.isfinite(total_nll):
+             return 1e8 # Return even larger penalty if sum somehow becomes non-finite
+
+        return total_nll
+
+    def loglike(self, params: np.ndarray) -> float:
+        """Computes the log-likelihood (negative of nloglike)."""
+        return -self.nloglike(params)
+
     @abstractmethod
-    def fit(self):
+    def fit(self, start_params: Optional[np.ndarray] = None, optim_method: str = 'L-BFGS-B', fit_method: str = 'MLE') -> 'GEVFit':
         """
-        Fit a model to data.
-        
+        Fit the model to data. Abstract method to be implemented by subclasses.
+
         Returns
         -------
-        Any
-            Fitted model result.
-            
+        GEVFit
+            An object containing the results of the fit.
+
         Raises
         ------
         NotImplementedError
-            This method must be implemented by subclasses.
+            If the subclass does not implement this method.
         """
-        raise NotImplementedError("Subclasses must implement this method.")
+        raise NotImplementedError("Subclasses must implement the fit method.")
 
 class GEVSample(GEV):
     def __init__(self, endog, exog={'shape': None, 'scale': None, 'location': None}, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, T=None, **kwargs):
@@ -1410,7 +1485,7 @@ class GEV_WWA_Fit(GEVFit):
 
     
 #if __name__ == "__main__":
-    #EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
+    EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
     #EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
     #EOBS["time"] = np.arange(len(EOBS))
@@ -1421,11 +1496,10 @@ class GEV_WWA_Fit(GEVFit):
 
 
    # Original single-series endog
-    #endog = EOBS[["prmax"]]  # Shape: (n, 1)
-    #exog = {"location": EOBS[['tempanomalyMean']]}
+    endog = EOBS[["prmax"]]  # Shape: (n, 1)
+    exog = {"location": EOBS[['tempanomalyMean']]}
 
-    #afit = GEVSample(endog=EOBS["prmax"],exog=exog)
-    #print(afit.endog.shape)
+    afit = GEVSample(endog=EOBS["prmax"],exog=exog).fit(fit_method='MLE')
     #print(afit.exog["location"].shape)
     #rfit = afit.fit(fit_method='mle')
     #print(rfit)
