@@ -245,260 +245,259 @@ class GEV(ABC):
         raise NotImplementedError("Subclasses must implement the fit method.")
 
 class GEVSample(GEV):
-    def __init__(self, endog, exog={'shape': None, 'scale': None, 'location': None}, loc_link=GEV.identity, scale_link=GEV.identity, shape_link=GEV.identity, T=None, **kwargs):
+    """
+    GEV model implementation for fitting a data sample.
+
+    Handles data input, validation, covariate processing, MLE and Profile fitting.
+    """
+    def __init__(self,
+                 endog: ArrayLike,
+                 exog: ExogInput = None, # Default to None is handled internally
+                 loc_link: Optional[LinkFunc] = None,
+                 scale_link: Optional[LinkFunc] = None,
+                 shape_link: Optional[LinkFunc] = None,
+                 T: Optional[int] = None,
+                 **kwargs: Any) -> None:
         """
-        Initializes the GEV model for a data sample with specified parameters.
-        
+        Initializes the GEVSample model.
+
         Parameters
         ----------
-        endog : array-like
-            Endogenous variable. Can be a list, NumPy array, Pandas Series, or any array-like object.
-            Can have shape (n,m) where n is the number of observations and m is the number of variables.M
-        exog : array-like or dict, optional
-            Exogenous variables for parameters. Can be:
-            - A list, NumPy array, or Pandas DataFrame to be used for all parameters
-            - A dictionary with keys 'shape', 'scale', and 'location', where values can be 
-            lists, NumPy arrays, or Pandas Series.
-        loc_link : callable, optional
-            Link function for the location parameter. Defaults to identity.
-        scale_link : callable, optional
-            Link function for the scale parameter. Defaults to identity.
-        shape_link : callable, optional
-            Link function for the shape parameter. Defaults to identity.
-        kwargs : dict
-            Additional keyword arguments.
-            
+        endog : ArrayLike
+            Endogenous variable(s). Shape (n_obs,) or (n_obs, n_samples).
+        exog : ExogInput, optional
+            Exogenous variables. Can be None, dict, array-like. See _process_exog.
+        loc_link : Optional[LinkFunc], optional
+            Link function for location. Defaults to identity.
+        scale_link : Optional[LinkFunc], optional
+            Link function for scale. Defaults to identity.
+        shape_link : Optional[LinkFunc], optional
+            Link function for shape. Defaults to identity.
+        T : Optional[int], optional
+            Return period for location reparameterization. Defaults to None.
+        kwargs : Any
+            Additional keyword arguments (currently unused).
+
         Raises
         ------
         ValueError
-            If endogenous data is empty or invalid, or if exogenous data shapes are inconsistent.
+            If data is empty, contains NaNs, or shapes are inconsistent.
         TypeError
-            If link functions are not callable or if inputs cannot be converted to appropriate types.
+            If inputs cannot be converted to numeric arrays or links aren't callable.
         """
-        #----------Initiate common parameters-----------
+        # Initialize base class attributes (links, T, reparam flag)
+        super().__init__(loc_link=loc_link, scale_link=scale_link, shape_link=shape_link, T=T)
 
-        super().__init__(loc_link=loc_link,scale_link=scale_link,shape_link=shape_link,T=T)
-        #----------Deal with Endog input-----------------
-        # Exceptions
+        #---------- Process Endog input ----------
+        if endog is None:
+            raise ValueError("The `endog` parameter must not be None.")
+        if hasattr(endog, '__len__') and len(endog) == 0:
+             raise ValueError("The `endog` parameter must not be empty.")
 
-        ## 1 : Endog has a length and elements.
-        if endog is None or (hasattr(endog, '__len__') and len(endog) == 0):
-            raise ValueError("The `endog` parameter must not be None or empty. Please provide valid endogenous data.")
-
-        
-        ## 2 : Endog is a dataframe, series or other array like data and can be converted to numpy.
         try:
-            # Handle pandas Series/DataFrame
+            # Convert various inputs to numpy array
             if isinstance(endog, (pd.Series, pd.DataFrame)):
-                self.endog = endog.values
-            # We assume it must be list or other array-like
+                endog_array = endog.values
+            elif isinstance(endog, xrs.DataArray):
+                 endog_array = endog.values
             else:
-                self.endog = np.asarray(endog)
-                
-            # Ensure it's a float array and has at least 2 dimensions
-            self.endog = self.endog.astype(float)
-            
-            # Handle different input shapes
+                endog_array = np.asarray(endog)
+
+            # Ensure float type
+            self.endog = endog_array.astype(np.float64) # Use float64 for precision
+
+            # Reshape 1D array to 2D column vector (n_obs, 1 sample)
             if self.endog.ndim == 1:
-                # Convert 1D array to 2D column vector
                 self.endog = self.endog.reshape(-1, 1)
-                
+            elif self.endog.ndim != 2:
+                 raise ValueError(f"endog must be 1D or 2D, but got {self.endog.ndim} dimensions.")
+
         except Exception as e:
-            raise TypeError(f"Could not convert endogenous data to a numeric array: {str(e)}")
-        
+            raise TypeError(f"Could not convert endogenous data to a 2D numeric array: {e}")
 
-        ## 3 : The elements of endog are not Nan.
         if np.isnan(self.endog).any():
-            raise ValueError("The `endog` parameter contains NaN values.")
-        
+            raise ValueError("The `endog` parameter contains NaN values. Please handle missing data before fitting.")
 
-        ## 4 : Link functions are callable if they are defined. 
-        for name, func in [('loc_link', self.loc_link), ('scale_link', self.scale_link), ('shape_link', self.shape_link)]:
-            if func is not None and not callable(func):
-                raise TypeError(f"The `{name}` parameter must be callable or None.")
+        #---------- Set Data Attributes ----------
+        self.n_obs, self.n_samples = self.endog.shape
+        self.N_total = self.endog.size # Total number of data points
 
+        #---------- Initial Guesses ----------
+        # Use overall mean/variance for initial guesses, even for multiple samples
+        endog_mean = np.nanmean(self.endog)
+        endog_var = np.nanmean(np.nanvar(self.endog, axis=0)) # Average variance across samples
 
-        # ------------------------
-        #1 Setting class attributes
+        # Gumbel-based initial guesses (Method of Moments for Gumbel)
+        self.scale_guess: float = max(np.sqrt(6 * endog_var) / np.pi, 1e-6) # Ensure positive
+        self.shape_guess: float = 0.1 # Common starting point for GEV shape
+        euler_gamma = 0.5772156649
 
-        ## 1 : Link functions attributes
-        self.loc_link = self.loc_link or self.identity
-        self.scale_link = self.scale_link or self.identity
-        self.shape_link = self.shape_link or self.identity
-        
-
-        ## 2 : Data and fit attributes
-        self.N_total = self.endog.size
-        self.n_obs = len(self.endog)
-        self.n_samples = self.endog.shape[1]  # Store the number of features
-        self.result = None
-        
-        # Calculate initial guesses for parameters
-        # For multiple variables, use the mean across all variables
-        if self.n_samples > 1:
-            endog_mean = np.mean(self.endog)
-            endog_var = np.mean(np.var(self.endog, axis=0))  # Average variance across features
+        if self.loc_return_level_reparam:
+            # Guess for zp (the T-year return level) based on Gumbel approx
+            if self.T is None: raise ValueError("T must be set for reparameterization guess.") # Should not happen
+            y_p_guess = -np.log(1 - 1 / self.T)
+            # Approximate zp using Gumbel quantile formula: zp ~ mu_g - scale_g * log(yp)
+            # where mu_g = mean - gamma * scale_g
+            mu_gumbel_guess = endog_mean - euler_gamma * self.scale_guess
+            self.location_guess: float = mu_gumbel_guess - self.scale_guess * np.log(y_p_guess)
+            # Note: This is the guess for zp, not mu
         else:
-            endog_mean = np.mean(endog)
-            endog_var = np.var(endog)
-            
-        self.scale_guess = np.sqrt(6 * endog_var) / np.pi
-        self.shape_guess = 0.1
+            # Guess for mu (location) based on Gumbel approx: mu ~ mean - gamma * scale
+             self.location_guess: float = endog_mean - euler_gamma * self.scale_guess
 
-        if self.T is not None:
-            y_p = -np.log(1 - 1 / self.T)
-            self.location_guess = endog_mean - (self.scale_guess / self.shape_guess) * (1 - y_p ** (-self.shape_guess))
-        else:
-            self.location_guess = endog_mean - 0.57722 * self.scale_guess
+        #---------- Process Exog Data ----------
+        self._process_exog(exog) # Populates self.exog, self.len_exog, self.nparams, self.trans
 
-        ##3 : Internal attributes
-        self._forced_param_index = -1
-        self._forced_param_value = 0
+        #---------- Fit Attributes Init ----------
+        self.result: Optional[OptimizeResult] = None # Store optimization result
+        self.fitted: bool = False # Flag
 
-        #---------------------------
-        # Handle exog data
-        self._process_exog(exog, **kwargs)
-
-    def _process_exog(self, 
-        exog: Any = None
-        ) -> Dict[str, np.ndarray]:
+    def _process_exog(self, exog_input: ExogInput) -> None:
         """
-        Processes and validates the exogenous data.
+        Processes and validates exogenous data, storing it internally.
+
+        Sets `self.exog`, `self.len_exog`, `self.nparams`, `self.trans`.
 
         Parameters
         ----------
-        exog : any, optional
-            Exogenous variables for parameters. Can be:
-            - None: Use default exogenous variables (a single column of ones) for all parameters.
-            - dict: A dictionary with keys 'shape', 'scale', 'location' mapping to exogenous variables for each parameter.
-                Each value can be:
-                - None: Use the default (a column of ones).
-                - array-like: An array-like object with shape (n_samples,) or (n_samples, n_samples).
-            - array-like: An array-like object with shape (n_samples,) or (n_samples, n_samples) to be used for all parameters.
-        Returns
-        -------
-        dict
-            Processed data dictionary with 'shape', 'scale', and 'location' keys.
-            
-        Raises
-        ------
-        ValueError
-            If exogenous data has inconsistent shapes or invalid structure.
-        TypeError
-            If exogenous data cannot be converted to numeric arrays.
+        exog_input : ExogInput
+            Exogenous variables provided by the user.
         """
-        param_names = ['shape', 'scale', 'location']
-        self.exog = {}
+        param_names: List[str] = ['location', 'scale', 'shape']
+        self.exog: Dict[str, np.ndarray] = {}
+        processed_exog_arrays: Dict[str, np.ndarray] = {}
 
-        # ---- Case 1 ---- : No exogenous variables provided (use default ones arrays)
-        if exog is None:
+        default_exog_array = np.ones((self.n_obs, 1, self.n_samples), dtype=np.float64)
+
+        # ---- Case 1: None provided ----
+        if exog_input is None:
             for param in param_names:
-                # Create a 3D array with shape (n_obs, 1, self.n_samples) filled with ones
-                self.exog[param] = np.ones((self.n_obs, 1, self.n_samples))
+                processed_exog_arrays[param] = default_exog_array
 
-        # ---- Case 2 ---- : Dictionary of exogenous variables
-        elif isinstance(exog, dict):
-            invalid_keys = [key for key in exog if key not in param_names]
+        # ---- Case 2: Dictionary provided ----
+        elif isinstance(exog_input, dict):
+            # Check for invalid keys first
+            invalid_keys = set(exog_input.keys()) - set(param_names)
             if invalid_keys:
-                raise ValueError(f"Invalid keys in exog dictionary: {invalid_keys}. Expected keys: {param_names}")
+                raise ValueError(f"Invalid keys in exog dictionary: {invalid_keys}. Expected keys from: {param_names}")
 
             for param in param_names:
-                param_exog = exog.get(param)
-                if param_exog is None:
-                    # Use default ones array with shape (n_obs, n_samples, 1)
-                    self.exog[param] = np.ones((self.n_obs, 1, self.n_samples))
+                param_exog_input = exog_input.get(param) # Use .get() for safety
+
+                if param_exog_input is None:
+                    processed_exog_arrays[param] = default_exog_array
                 else:
-                    if hasattr(param_exog, 'values') and hasattr(param_exog, 'dims'):
-                        # It's an xarray DataArray
-                        try:
-                            param_exog_array = param_exog.values.astype(float)
-                        except Exception as e:
-                            raise TypeError(f"Could not convert xarray exog['{param}'] to a numeric array: {str(e)}")
-                        
-                    elif isinstance(param_exog, (pd.Series, pd.DataFrame)):
-                        param_exog_array = param_exog.values.astype(float)
-                    else:
-                    # Assume it's a numpy array or numpy-array-like
-                        try:
-                            param_exog_array = np.asarray(param_exog, dtype=float)
-                        except Exception as e:
-                            raise TypeError(f"Could not convert exog['{param}'] to a numeric array: {str(e)}")
-                    
-                    self.exog[param] = self._validate_and_process_exog_array(param_exog_array, param)
+                     # Convert various inputs to a NumPy array
+                    try:
+                        if isinstance(param_exog_input, (pd.Series, pd.DataFrame)):
+                            param_exog_array = param_exog_input.values.astype(np.float64)
+                        elif isinstance(param_exog_input, xrs.DataArray):
+                            param_exog_array = param_exog_input.values.astype(np.float64)
+                        else:
+                            param_exog_array = np.asarray(param_exog_input, dtype=np.float64)
+                    except Exception as e:
+                         raise TypeError(f"Could not convert exog['{param}'] to a numeric array: {e}")
 
-        # ---- Case 3 ---- : Array like object           
+                    # Validate shape and add intercept
+                    processed_exog_arrays[param] = self._validate_and_reshape_exog_array(param_exog_array, param)
+
+        # ---- Case 3: Single ArrayLike provided (use for all params) ----
         else:
-            # Handle xarray.DataArray
-            if hasattr(exog, 'values') and hasattr(exog, 'dims'):
-                # It's an xarray DataArray
-                try:
-                    param_exog_array = exog.values.astype(float)
-                except Exception as e:
-                    raise TypeError(f"Could not convert xarray exog to a numeric array: {str(e)}")
-                
-            elif isinstance(exog, (pd.Series, pd.DataFrame)):
-                param_exog_array = exog.values.astype(float)
-            else:
-                # Assume it's a numpy array or numpy-array-like
-                try:
-                    param_exog_array = np.asarray(exog, dtype=float)
-                except Exception as e:
-                    raise TypeError(f"Could not convert exog to a numeric array: {str(e)}")
-                
-            self.exog = {param: self._validate_and_process_exog_array(param_exog_array, param) for param in param_names}  
+             # Convert various inputs to a NumPy array
+            try:
+                if isinstance(exog_input, (pd.Series, pd.DataFrame)):
+                     param_exog_array = exog_input.values.astype(np.float64)
+                elif isinstance(exog_input, xrs.DataArray):
+                     param_exog_array = exog_input.values.astype(np.float64)
+                else:
+                     param_exog_array = np.asarray(exog_input, dtype=np.float64)
+            except Exception as e:
+                 raise TypeError(f"Could not convert the provided single exog input to a numeric array: {e}")
 
-        if all(np.array_equal(self.exog[key], np.ones((self.n_obs, 1, self.n_samples))) for key in param_names):
-            self.trans = False
-        else:
-            self.trans = True
-        self.len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1])
-        self.nparams = sum(self.len_exog)
+             # Validate shape and add intercept for each parameter
+            for param in param_names:
+                 # Process a copy to avoid modifying the original array across loops if it's mutable
+                 processed_exog_arrays[param] = self._validate_and_reshape_exog_array(param_exog_array.copy(), param)
+
+        # Store processed arrays in self.exog
+        self.exog = processed_exog_arrays
+
+        # Determine if any real covariates were added (beyond intercept)
+        self.trans: bool = not all(
+             exog_array.shape[1] == 1 for exog_array in self.exog.values()
+        )
+
+        # Calculate lengths and total parameters
+        self.len_exog: Tuple[int, int, int] = (
+            self.exog['location'].shape[1],
+            self.exog['scale'].shape[1],
+            self.exog['shape'].shape[1]
+        )
+        self.nparams: int = sum(self.len_exog)
 
 
-    def _validate_and_process_exog_array(self, exog_array: np.ndarray, param_name: str) -> np.ndarray:
+    def _validate_and_reshape_exog_array(self, exog_array: np.ndarray, param_name: str) -> np.ndarray:
         """
-        Helper function to validate and process exogenous arrays.
+        Validates covariate array shape and reshapes to (n_obs, n_covariates + 1, n_samples).
+        Adds an intercept column.
 
         Parameters
         ----------
         exog_array : np.ndarray
-            Array to validate and process.
+            The input covariate array (already converted to numeric).
         param_name : str
-            Parameter name for error messages ('shape', 'scale', or 'location').
-        n_samples : int
-            Number of features in endogenous data.
+            Name of the parameter ('location', 'scale', 'shape') for error messages.
 
         Returns
         -------
         np.ndarray
-            Processed exogenous array.
+            The validated and reshaped array with intercept, shape (n_obs, n_covariates + 1, n_samples).
         """
+        target_shape_3d = (self.n_obs, -1, self.n_samples) # Target shape after adding intercept
+
+        # ---- Input shape validation and initial reshape to (n_obs, n_raw_cov, n_samples) ----
         if exog_array.ndim == 1:
+            # Assumed shape (n_obs,) -> treat as one covariate varying with observation, constant across samples
             if exog_array.shape[0] != self.n_obs:
-                raise ValueError(
-                    f"The length of exog['{param_name}'] ({exog_array.shape[0]}) must match the number of samples in endog ({self.n_obs})."
-                )
-            exog_array = np.repeat(exog_array.reshape(self.n_obs, 1, 1), self.n_samples, axis=2)
+                 raise ValueError(f"1D exog['{param_name}'] length ({exog_array.shape[0]}) must match n_obs ({self.n_obs}).")
+            # Reshape to (n_obs, 1 covariate, 1 sample) then broadcast to n_samples
+            reshaped_exog = exog_array.reshape(self.n_obs, 1, 1)
+            reshaped_exog = np.repeat(reshaped_exog, self.n_samples, axis=2) # Shape (n_obs, 1, n_samples)
 
         elif exog_array.ndim == 2:
-            if exog_array.shape != (self.n_obs, self.n_samples):
-                raise ValueError(
-                    f"exog['{param_name}'] is allowed to have shape ({self.n_obs}, {self.n_samples}), but got {exog_array.shape}."
-                )
-            exog_array = exog_array.reshape(self.n_obs, 1, self.n_samples)
+            # Could be (n_obs, n_samples) or (n_obs, n_covariates)
+            if exog_array.shape == (self.n_obs, self.n_samples):
+                 # Assumed one covariate varying with obs and sample
+                 reshaped_exog = exog_array.reshape(self.n_obs, 1, self.n_samples) # Shape (n_obs, 1, n_samples)
+            elif exog_array.shape[0] == self.n_obs:
+                 # Assumed (n_obs, n_covariates), constant across samples
+                 n_cov = exog_array.shape[1]
+                 reshaped_exog = exog_array.reshape(self.n_obs, n_cov, 1)
+                 reshaped_exog = np.repeat(reshaped_exog, self.n_samples, axis=2) # Shape (n_obs, n_cov, n_samples)
+            else:
+                 raise ValueError(f"2D exog['{param_name}'] shape {exog_array.shape} is incompatible with endog shape ({self.n_obs}, {self.n_samples}). Expected ({self.n_obs}, {self.n_samples}) or ({self.n_obs}, n_covariates).")
+
         elif exog_array.ndim == 3:
-            n_obs_match, _, n_samples_match = exog_array.shape
-            if (n_obs_match, n_samples_match) != (self.n_obs, self.n_samples):
-                raise ValueError(
-                    f"exog['{param_name}'] must have first and third dimensions "
-                    f"({self.n_obs}, {self.n_samples}), but got ({n_obs_match}, {n_samples_match})."
-                )
+            # Must be (n_obs, n_covariates, n_samples)
+            if exog_array.shape[0] != self.n_obs or exog_array.shape[2] != self.n_samples:
+                 raise ValueError(f"3D exog['{param_name}'] shape {exog_array.shape} is incompatible with endog shape ({self.n_obs}, {self.n_samples}). Expected ({self.n_obs}, n_covariates, {self.n_samples}).")
+            reshaped_exog = exog_array # Already in correct shape structure
 
         else:
-            raise ValueError(f"exog['{param_name}'] has invalid number of dimensions: {exog_array.ndim}")
-        
-        exog_array = np.concatenate([np.ones((self.n_obs, 1, self.n_samples)), exog_array], axis=1)
-        return exog_array
+            raise ValueError(f"exog['{param_name}'] has an invalid number of dimensions: {exog_array.ndim}. Expected 1, 2, or 3.")
+
+        # ---- Add Intercept ----
+        # Create intercept array matching the shape (n_obs, 1, n_samples)
+        intercept = np.ones((self.n_obs, 1, self.n_samples), dtype=np.float64)
+
+        # Concatenate intercept along the covariate axis (axis=1)
+        final_exog = np.concatenate([intercept, reshaped_exog], axis=1)
+
+        # Final check for NaNs
+        if np.isnan(final_exog).any():
+             raise ValueError(f"exog['{param_name}'] contains NaN values after processing.")
+
+        return final_exog
 
     def hess(self, params):
         """
@@ -1484,7 +1483,7 @@ class GEV_WWA_Fit(GEVFit):
 
 
     
-#if __name__ == "__main__":
+if __name__ == "__main__":
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
     #EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
@@ -1500,6 +1499,7 @@ class GEV_WWA_Fit(GEVFit):
     exog = {"location": EOBS[['tempanomalyMean']]}
 
     afit = GEVSample(endog=EOBS["prmax"],exog=exog).fit(fit_method='MLE')
+    print(afit)
     #print(afit.exog["location"].shape)
     #rfit = afit.fit(fit_method='mle')
     #print(rfit)
