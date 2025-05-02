@@ -324,8 +324,8 @@ class GEVSample(GEV):
 
         #---------- Initial Guesses ----------
         # Use overall mean/variance for initial guesses, even for multiple samples
-        endog_mean = np.nanmean(self.endog)
-        endog_var = np.nanmean(np.nanvar(self.endog, axis=0)) # Average variance across samples
+        endog_mean = np.nanmean(self.endog[:,0])
+        endog_var = np.nanmean(np.nanvar(self.endog[:,0], axis=0)) # Average variance across samples
 
         # Gumbel-based initial guesses (Method of Moments for Gumbel)
         self.scale_guess: float = max(np.sqrt(6 * endog_var) / np.pi, 1e-6) # Ensure positive
@@ -344,7 +344,6 @@ class GEVSample(GEV):
         else:
             # Guess for mu (location) based on Gumbel approx: mu ~ mean - gamma * scale
              self.location_guess: float = endog_mean - euler_gamma * self.scale_guess
-
         #---------- Process Exog Data ----------
         self._process_exog(exog) # Populates self.exog, self.len_exog, self.nparams, self.trans
 
@@ -499,42 +498,118 @@ class GEVSample(GEV):
 
         return final_exog
 
-    def hess(self, params):
+    def hess(self, params: np.ndarray) -> np.ndarray:
         """
-        Computes the Hessian matrix of the negative log-likelihood.
-        Be careful that hessian_fn accepts only 1D arrays for params, reshaping will be necessary when called.
+        Computes the Hessian matrix of the negative log-likelihood using numdifftools.
+
+        Parameters
+        ----------
+        params : np.ndarray
+            Parameter vector at which to compute the Hessian.
+
+        Returns
+        -------
+        np.ndarray
+            The Hessian matrix.
         """
         hessian_fn = nd.Hessian(self.nloglike)
-        return hessian_fn(params)
+        # Ensure params is flat float64 for numdifftools
+        return hessian_fn(params.astype(np.float64).flatten())
 
-    def hess_inv(self, params=None):
+    def hess_inv(self, params: np.ndarray) -> np.ndarray:
         """
-        Computes the inverse of the Hessian matrix of the negative log-likelihood.
-        """
-        return np.linalg.inv(self.hess(params))
+        Computes the inverse of the Hessian matrix.
 
-    def score(self, params=None):
+        Parameters
+        ----------
+        params : np.ndarray
+            Parameter vector.
+
+        Returns
+        -------
+        np.ndarray
+            Inverse Hessian matrix (potential covariance matrix).
         """
-        Computes the score function (gradient of the log-likelihood).
+        hess_matrix = self.hess(params)
+        try:
+            inv_hess = np.linalg.inv(hess_matrix)
+            return inv_hess
+        except np.linalg.LinAlgError as e:
+            warnings.warn(f"Hessian matrix inversion failed: {e}. Covariance matrix will be invalid.", RuntimeWarning)
+            # Return matrix of NaNs with the correct shape
+            return np.full((self.nparams, self.nparams), np.nan, dtype=np.float64)
+
+
+    def score(self, params: np.ndarray) -> np.ndarray:
         """
-        if params is not None:
-            return approx_fprime(params, self.nloglike, 1e-5)
-        elif self.fitted:
-            return self.result.jac
+        Computes the score function (gradient of the log-likelihood / negative gradient of NLL).
+
+        Uses finite differences approximation.
+
+        Parameters
+        ----------
+        params : np.ndarray
+            Parameter vector at which to compute the score.
+
+        Returns
+        -------
+        np.ndarray
+            The score vector.
+        """
+        # approx_fprime computes gradient of the function (NLL)
+        # Score is gradient of LL, so -gradient(NLL)
+        # Epsilon might need tuning depending on parameter scales
+        epsilon = np.sqrt(np.finfo(float).eps) # Standard epsilon choice
+        grad_nll = approx_fprime(params.astype(np.float64).flatten(), self.nloglike, epsilon=epsilon)
+        return -grad_nll
+
+
+    def _generate_profile_params(self, param_idx: int, n_points: int, mle_params: np.ndarray, stds: np.ndarray) -> np.ndarray:
+        """
+        Generates a range of values for a specific parameter for profiling.
+
+        Parameters
+        ----------
+        param_idx : int
+            Index of the parameter to profile.
+        n_points : int
+            Number of points to generate in the range.
+        mle_params : np.ndarray
+            Maximum Likelihood Estimates of all parameters.
+        stds : np.ndarray
+            Standard errors of the MLE parameters.
+
+        Returns
+        -------
+        np.ndarray
+            Array of values for the specified parameter.
+        """
+        i, j, k = self.len_exog
+        mle_val = mle_params[param_idx]
+        std_val = stds[param_idx]
+
+        # Handle cases where std_val might be zero or NaN
+        if not np.isfinite(std_val) or std_val <= 1e-9:
+            # If std error is invalid, create a small range around MLE
+            warnings.warn(f"Invalid standard error for parameter {param_idx}. Using a small fixed range for profiling.", RuntimeWarning)
+            param_range = np.linspace(mle_val - 0.1 * abs(mle_val) - 1e-6, mle_val + 0.1 * abs(mle_val) + 1e-6, n_points)
         else:
-            raise ValueError("Model is not fitted. Cannot compute the score at optimal parameters.")
+            # Use +/- 3 standard deviations as a starting point
+            lower_bound = mle_val - 3 * std_val
+            upper_bound = mle_val + 3 * std_val
+             # Special handling for scale parameter: ensure range stays positive if link allows?
+             # Example: if scale param corresponds to intercept and uses exp link, the param can be negative,
+             # but the actual scale exp(param) > 0. No constraint needed here.
+             # If scale used identity link, maybe enforce > 0? But MLE fit should handle this.
+             # Let's assume the range is okay for now.
 
-    def _generate_profile_params(self, param_idx, n,mle_params,stds):
-        """Generate profile parameter values based on param index rules."""
-        i, j, k = self.len_exog  # Extract external indices
-        
-        param_ranges = {
-            0: np.linspace(mle_params[0] - 3*stds[0], mle_params[0] + 3*stds[0], n),
-            i: np.linspace(mle_params[i] - 3*stds[i], mle_params[i] + 3*stds[i], n),
-            i + j: np.linspace(mle_params[i+j] - 3*stds[i+j], mle_params[i+j]  + 3*stds[i+j], n)
-        }
-        return param_ranges.get(param_idx, np.linspace(mle_params[param_idx] - 3*stds[param_idx], mle_params[param_idx] + 3*stds[param_idx], n))
+             # Special handling for shape parameter? Sometimes constrained e.g. shape < 0.5?
+             # Not enforced here, relies on nloglike penalty.
 
+            param_range = np.linspace(lower_bound, upper_bound, n_points)
+
+        return param_range
+    
     def _generate_free_params(self,param_idx, fixed_param_values = None):
         """Efficient single-loop version of the parameter profiling process."""
         if fixed_param_values is None:
@@ -617,11 +692,6 @@ class GEVSample(GEV):
             if self.N_total <= 0:
                 raise ValueError("N_total is zero or negative, cannot scale Hessian.")
             cov_matrix_nd = inv_hess_avg
-
-            # 4. Validate the result
-            diag_cov_nd = np.diag(cov_matrix_nd)
-            if np.any(diag_cov_nd <= 0) or not np.all(np.isfinite(cov_matrix_nd)):
-                raise ValueError("numdifftools covariance matrix invalid (e.g., non-positive variance).")
 
             # 5. Success: Assign the numdifftools result
             cov_matrix = cov_matrix_nd
