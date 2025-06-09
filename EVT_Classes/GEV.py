@@ -1554,8 +1554,9 @@ class GEV_WWA_Fit(GEVFit):
 
     
 if __name__ == "__main__":
-    EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
+    #EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
+    EOBS = pd.read_csv(r"c:\ThesisData\Blockmax\EOBS_blockmax.csv")
     #EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
     #EOBS["time"] = np.arange(len(EOBS))
     #n = len(EOBS["prmax"].values.reshape(-1,1))
@@ -1566,7 +1567,7 @@ if __name__ == "__main__":
 
    # Original single-series endog
     endog = EOBS[["prmax"]]  # Shape: (n, 1)
-    exog = {"location": EOBS[['tempanomalyMean']]}
+    exog = {"location": EOBS[['tempanomalyMean']],"scale": EOBS[['tempanomalyMean']]}
 
     afit = GEVSample(endog=EOBS["prmax"],exog=exog).fit(fit_method='MLE')
     print(afit)
