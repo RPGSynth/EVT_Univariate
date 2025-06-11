@@ -3,8 +3,8 @@ import xarray as xr
 
 def xarray_to_endog_exog(ds: xr.Dataset,
                          endog_var: str,
-                         include_space_coords: bool = False,
-                         include_time_coords: bool = False
+                         include_space_coords: bool = True,
+                         include_time_coords: bool = True
                          ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Transform an xarray Dataset into NumPy arrays: endog and exog, plus metadata.
@@ -177,3 +177,94 @@ def xarray_to_endog_exog(ds: xr.Dataset,
 
     return endog, exog, metadata
 
+
+def endog_exog_to_xarray(endog: np.ndarray, exog: np.ndarray, endog_var: str, metadata: dict) -> xr.Dataset:
+    """
+    Transform endog and exog NumPy arrays back into an xarray Dataset using metadata.
+
+    Parameters:
+    -----------
+    endog : np.ndarray
+        The endogenous variable array of shape (t, s).
+    exog : np.ndarray
+        The exogenous variables array of shape (t, c, s).
+    endog_var : str
+        The name of the endogenous variable.
+    metadata : dict
+        Metadata from xarray_to_endog_exog with 't', 'n_lat', 'n_lon', and 'covariates'.
+
+    Returns:
+    --------
+    xr.Dataset
+        The reconstructed xarray Dataset with dimensions 'time', 'lat', 'lon'.
+
+    Raises:
+    -------
+    ValueError
+        If the shapes of endog or exog do not match the metadata dimensions.
+        If the number of covariates in exog does not match metadata.
+    """
+    # Extract metadata
+    t = metadata['t']
+    n_lat = metadata['n_lat']
+    n_lon = metadata['n_lon']
+    s = n_lat * n_lon
+    covariates = metadata['covariates']
+
+    # Validate input shapes
+    if endog.shape != (t, s):
+        raise ValueError(f"endog must have shape ({t}, {s}), got {endog.shape}")
+    if exog.shape != (t, len(covariates), s):
+        raise ValueError(f"exog must have shape ({t}, {len(covariates)}, {s}), got {exog.shape}")
+
+    # Initialize coordinate arrays
+    time = np.arange(t)
+    lat = None
+    lon = None
+
+    # Extract lat and lon from exog where is_coord=True
+    for i, cov in enumerate(covariates):
+        if cov['is_coord']:
+            data = exog[:, i, :]
+            if cov['name'] == 'lat':
+                # Take the first time slice and reshape to original lat array
+                lat = data[0, :].reshape(n_lat, n_lon)[:, 0]  # Extract unique lat values
+            elif cov['name'] == 'lon':
+                # Take the first time slice and reshape to original lon array
+                lon = data[0, :].reshape(n_lat, n_lon)[0, :]  # Extract unique lon values
+
+    if lat is None or lon is None:
+        raise ValueError("Latitude or longitude coordinates not found in exog covariates.")
+
+    # Reshape endog back to (t, n_lat, n_lon)
+    endog_reshaped = endog.reshape(t, n_lat, n_lon)
+
+    # Initialize the dataset with the endogenous variable and original coordinates
+    ds = xr.Dataset(
+        {endog_var: (['time', 'lat', 'lon'], endog_reshaped)},
+        coords={'time': time, 'lat': lat, 'lon': lon}
+    )
+
+    # Reconstruct exogenous variables (excluding coordinates)
+    for i, cov in enumerate(covariates):
+        if cov['is_coord']:
+            continue  # Skip lat and lon as they’re already in coords
+        name = cov['name']
+        dims = cov['dims']
+        data = exog[:, i, :]
+
+        if set(dims) == {'time', 'lat', 'lon'}:
+            ds[name] = (['time', 'lat', 'lon'], data.reshape(t, n_lat, n_lon))
+        elif set(dims) == {'lat', 'lon'}:
+            ds[name] = (['lat', 'lon'], data[0].reshape(n_lat, n_lon))
+        elif len(dims) == 1:
+            if dims[0] == 'time':
+                ds[name] = (['time'], data[:, 0])
+            elif dims[0] == 'lat':
+                ds[name] = (['lat'], data[0].reshape(n_lat, n_lon).mean(axis=1))
+            elif dims[0] == 'lon':
+                ds[name] = (['lon'], data[0].reshape(n_lat, n_lon).mean(axis=0))
+        else:
+            raise ValueError(f"Unsupported dimensions for variable '{name}': {dims}")
+            
+    return ds

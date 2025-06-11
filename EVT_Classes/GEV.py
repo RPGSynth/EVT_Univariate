@@ -15,6 +15,8 @@ import numdifftools as nd
 # import statsmodels.api as sms # Not used directly in GEV part?
 # import matplotlib.pyplot as plt # Used only in deprecated plot part
 # from matplotlib import rcParams # Used only in deprecated plot part
+import matplotlib.pyplot as plt
+import matplotlib as mpl
 from scipy.optimize import minimize, approx_fprime, OptimizeResult
 from scipy.stats import norm, chi2, gumbel_r, genextreme
 # from statsmodels.base.model import GenericLikelihoodModel # Not used directly
@@ -43,7 +45,7 @@ class GEV(ABC):
         Link function for the shape parameter.
     loc_return_level_reparam : bool
         Flag indicating if location is reparameterized by return level.
-    T : Optional[int]
+    T : Optional[Union[int,float]]
         Return period used for reparameterization.
     endog : np.ndarray
         Endogenous data array, shape (n_obs, n_samples).
@@ -63,7 +65,7 @@ class GEV(ABC):
     scale_link: LinkFunc
     shape_link: LinkFunc
     loc_return_level_reparam: bool
-    T: Optional[int]
+    T: Optional[Union[int,float]]
 
     @staticmethod
     def identity(x: np.ndarray) -> np.ndarray:
@@ -81,7 +83,7 @@ class GEV(ABC):
         loc_link: Optional[LinkFunc] = None,
         scale_link: Optional[LinkFunc] = None,
         shape_link: Optional[LinkFunc] = None,
-        T : Optional[int] = None
+        T : Optional[Union[int,float]] = None
         ) -> None:
         """
         Initializes the GEV model configuration.
@@ -94,22 +96,24 @@ class GEV(ABC):
             Link function for scale parameter. Defaults to identity.
         shape_link : Optional[LinkFunc], optional
             Link function for shape parameter. Defaults to identity.
-        T : Optional[int], optional
+        T : Optional[Union[int,float]], optional
             Return period for reparameterizing location. Defaults to None.
         """
         self.loc_link = loc_link if loc_link is not None else self.identity
         self.scale_link = scale_link if scale_link is not None else self.identity
         self.shape_link = shape_link if shape_link is not None else self.identity
-        self.loc_return_level_reparam = T is not None and T > 1
-        if self.loc_return_level_reparam:
-            if T is None or T <= 1: # Should not happen due to check above, but defensive
+        self.loc_return_level_reparam = T is not None and T>1
+        if T is not None:
+            print(T)
+            if T <= 1: 
                  raise ValueError("Return period T must be greater than 1 for reparameterization.")
             logging.info("ℹ️ The location parameter (μ) will be redefined in terms of return levels (z_p), "
                          "as you have specified a return period (T > 1).")
+
         self.T = T
 
 
-    def nloglike(self, params: np.ndarray, forced_indices: Optional[Union[int, List[int], np.ndarray]] = None, forced_param_values: Optional[Union[float, List[float], np.ndarray]] = None) -> float:
+    def nloglike(self, params: np.ndarray, weights: Optional[np.ndarray] = None, forced_indices: Optional[Union[int, List[int], np.ndarray]] = None, forced_param_values: Optional[Union[float, List[float], np.ndarray]] = None) -> float:
         """
         Computes the negative log-likelihood of the GEV model.
 
@@ -125,6 +129,21 @@ class GEV(ABC):
         Returns:
             float: Negative log-likelihood value. Returns 1e7 for invalid parameter combinations.
         """
+        if weights is None:
+            weights = getattr(self, "weights", None)
+            if weights is None:
+                weights = np.ones_like(self.endog)      # all observations get weight 1
+
+        if weights.shape != self.endog.shape:
+            raise ValueError("`weights` must have shape (n_obs, n_samples).")
+
+        if np.any(weights < 0) or not np.all(np.isfinite(weights)):
+            raise ValueError("`weights` must be finite and non-negative.")
+
+        total_weight = weights.sum()
+        if total_weight == 0:
+            raise ValueError("Sum of weights is zero; likelihood is undefined.")
+    
         full_params = params # Placeholder - needs adjustment if called directly with fixed params
 
         # Extract the number of covariates for each parameter
@@ -140,11 +159,12 @@ class GEV(ABC):
         # Shape of params_param: (n_cov_param,)
         # Result shape: (n_obs, n_samples)
         scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], scale_params))
+        print("scale = " + str(np.mean(scale)))
         if np.any(scale <= 1e-9): # Use a small epsilon instead of 0 for stability
             return 1e7 # Increased penalty
 
         shape = self.shape_link(np.einsum('nkp,k->np', self.exog['shape'], shape_params))
-
+        print("shape = " + str(np.mean(shape)))
         # Compute location parameter (mu or zp)
         if self.loc_return_level_reparam:
             if self.T is None: # Should be set if loc_return_level_reparam is True
@@ -172,6 +192,7 @@ class GEV(ABC):
         else:
             # Standard location parameter calculation
             location = self.loc_link(np.einsum('nip,i->np', self.exog['location'], loc_params))
+            print("loc = " + str(np.mean(location)))
             if np.any(~np.isfinite(location)):
                  return 1e7
 
@@ -185,7 +206,7 @@ class GEV(ABC):
 
         # Check for invalid values: 1 + xi * (y - mu) / sigma > 0 for xi != 0
         # This check should technically be done *before* log/power operations
-        invalid_gev_domain = (~is_gumbel) & (transformed_data <= 1e-9) # Use epsilon
+        invalid_gev_domain =  (weights > 0) & (~is_gumbel) & (transformed_data <= 1e-9) # Use epsilon
         if np.any(invalid_gev_domain):
              return 1e7
 
@@ -215,13 +236,14 @@ class GEV(ABC):
             return 1e7
 
         # Total negative log-likelihood (sum over all observations and samples)
-        total_nll = np.sum(n_ll_terms)
+        avg_nll = np.sum(n_ll_terms)
 
         # Final check if total NLL is finite
-        if not np.isfinite(total_nll):
+        if not np.isfinite(avg_nll):
              return 1e8 # Return even larger penalty if sum somehow becomes non-finite
-
-        return total_nll
+        
+        print(avg_nll)
+        return avg_nll
 
     def loglike(self, params: np.ndarray) -> float:
         """Computes the log-likelihood (negative of nloglike)."""
@@ -252,11 +274,12 @@ class GEVSample(GEV):
     """
     def __init__(self,
                  endog: ArrayLike,
-                 exog: ExogInput = None, # Default to None is handled internally
+                 exog: ExogInput = None, # Default to None is handled 
+                 weights : Optional[np.ndarray] =None,
                  loc_link: Optional[LinkFunc] = None,
                  scale_link: Optional[LinkFunc] = None,
                  shape_link: Optional[LinkFunc] = None,
-                 T: Optional[int] = None,
+                 T: Optional[Union[int,float]] = None,
                  **kwargs: Any) -> None:
         """
         Initializes the GEVSample model.
@@ -273,7 +296,7 @@ class GEVSample(GEV):
             Link function for scale. Defaults to identity.
         shape_link : Optional[LinkFunc], optional
             Link function for shape. Defaults to identity.
-        T : Optional[int], optional
+        T : Optional[Union[int,float]], optional
             Return period for location reparameterization. Defaults to None.
         kwargs : Any
             Additional keyword arguments (currently unused).
@@ -288,6 +311,7 @@ class GEVSample(GEV):
         # Initialize base class attributes (links, T, reparam flag)
         super().__init__(loc_link=loc_link, scale_link=scale_link, shape_link=shape_link, T=T)
 
+        self.weights = weights
         #---------- Process Endog input ----------
         if endog is None:
             raise ValueError("The `endog` parameter must not be None.")
@@ -339,11 +363,11 @@ class GEVSample(GEV):
             # Approximate zp using Gumbel quantile formula: zp ~ mu_g - scale_g * log(yp)
             # where mu_g = mean - gamma * scale_g
             mu_gumbel_guess = endog_mean - euler_gamma * self.scale_guess
-            self.location_guess: float = mu_gumbel_guess - self.scale_guess * np.log(y_p_guess)
+            self.location_guess = mu_gumbel_guess - self.scale_guess * np.log(y_p_guess)
             # Note: This is the guess for zp, not mu
         else:
             # Guess for mu (location) based on Gumbel approx: mu ~ mean - gamma * scale
-             self.location_guess: float = endog_mean - euler_gamma * self.scale_guess
+             self.location_guess = endog_mean - euler_gamma * self.scale_guess
         #---------- Process Exog Data ----------
         self._process_exog(exog) # Populates self.exog, self.len_exog, self.nparams, self.trans
 
@@ -498,7 +522,7 @@ class GEVSample(GEV):
 
         return final_exog
 
-    def hess(self, params: np.ndarray) -> np.ndarray:
+    def hess(self, params: np.ndarray):
         """
         Computes the Hessian matrix of the negative log-likelihood using numdifftools.
 
@@ -513,8 +537,9 @@ class GEVSample(GEV):
             The Hessian matrix.
         """
         hessian_fn = nd.Hessian(self.nloglike)
+        hessian = hessian_fn(params.astype(np.float64).flatten())
         # Ensure params is flat float64 for numdifftools
-        return hessian_fn(params.astype(np.float64).flatten())
+        return hessian
 
     def hess_inv(self, params: np.ndarray) -> np.ndarray:
         """
@@ -540,7 +565,7 @@ class GEVSample(GEV):
             return np.full((self.nparams, self.nparams), np.nan, dtype=np.float64)
 
 
-    def score(self, params: np.ndarray) -> np.ndarray:
+    def score(self, params: np.ndarray):
         """
         Computes the score function (gradient of the log-likelihood / negative gradient of NLL).
 
@@ -632,6 +657,7 @@ class GEVSample(GEV):
         profile_mles = np.empty(n)
         param_values = np.empty(n)
 
+        #Expected error, the likelihood function was changed and I didn't added profile params yet.
         profile_params = self._generate_profile_params(param_idx=param_idx,n=n,mle_params=mle_params,stds=stds)
         free_params = self._generate_free_params(param_idx=param_idx)
         for n_i, param_value in enumerate(profile_params):
@@ -646,10 +672,10 @@ class GEVSample(GEV):
         """
         Fits the model using the specified method (MLE or Profile).
         """
-        RL_args = {"reparam": self.loc_return_level_reparam}
+        RL_args : dict[str, bool | int] = {"reparam": self.loc_return_level_reparam}
 
         if RL_args["reparam"]:  # Only include T if reparam is True
-            RL_args["T"] = self.T
+            RL_args["T"] = 1
 
         match fit_method.lower():
             case "mle":
@@ -672,40 +698,31 @@ class GEVSample(GEV):
             )
         
         self.result = minimize(self.nloglike, start_params, method=optim_method)
+        if self.result is None:
+            raise ValueError(f"No results was outputed")
+
         # Handle failure case: maybe return NaNs or raise error
         if not self.result.success:
             raise ValueError(f"Optim issues can often stem from bad automatic starting parameters.\n"
               f"  Suggestion: Verify your `start_params` and/or provide manual initial guesses (especially intercepts) in the start_params attribute of the fit method.", RuntimeWarning)
-
         mle_params = self.result.x
-        cov_matrix = np.full((self.nparams, self.nparams), np.nan, dtype=np.float64)
-        hessian_func = nd.Hessian(self.nloglike) # Assumes nloglike takes/returns float64 compatible values
 
+        hessian_func = nd.Hessian(self.nloglike)
+        H_bar        = hessian_func(mle_params) 
+
+        if getattr(self, "weights", None) is None:
+            total_weight = self.endog.size          # all weights = 1
+        else:
+            total_weight = float(np.sum(self.weights))
+
+        # 3-b)  Invert with small ridge in case of near-singularity
         try:
-            # 1. Attempt calculation with numdifftools
-            hess_avg = hessian_func(mle_params) # Calculate Hessian of average NLL
-
-            # 2. Attempt inversion
-            inv_hess_avg = np.linalg.inv(hess_avg)
-
-            # 3. Attempt scaling
-            if self.N_total <= 0:
-                raise ValueError("N_total is zero or negative, cannot scale Hessian.")
-            cov_matrix_nd = inv_hess_avg
-
-            # 5. Success: Assign the numdifftools result
-            cov_matrix = cov_matrix_nd
-
-        except (np.linalg.LinAlgError, ValueError, TypeError, RuntimeError) as e_nd:
-            # Catch calculation, inversion, or validation errors from numdifftools path
-            warnings.warn(f"numdifftools Hessian calculation/inversion failed: {e_nd}.\n"
-              f"  Hessian issues after optimization can often stem from convergence to a problematic parameter region, potentially due to the automatic starting parameters.\n"
-              f"  Suggestion: Verify your `start_params` or provide manual initial guesses (especially intercepts) in the start_params attribute of the fit method.", RuntimeWarning)
-
-        # Catch any other unexpected exceptions during the whole process
-        except Exception as e_other:
-            warnings.warn(f"Unexpected error during Hessian/Covariance calculation: {e_other}", RuntimeWarning)
-            # cov_matrix remains NaN from initialization
+            cov_matrix = np.linalg.inv(H_bar)
+        except np.linalg.LinAlgError:
+            print("WOOOOOO")
+            # add 1e-6 * I ridge to the Hessian and retry
+            ridge      = 1e-6 * np.eye(H_bar.shape[0])
+            cov_matrix = np.linalg.inv(H_bar + ridge)
 
         fitted_loc = self.loc_link(np.einsum('nip,i->np', self.exog['location'], self.result.x[:i]))
         fitted_scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], self.result.x[i:i+j]))
@@ -799,6 +816,7 @@ class GEVSample(GEV):
 
             nloglike_partial = partial(self.nloglike,forced_indices=i,forced_param_values=0.01)
             nll_0 = minimize(nloglike_partial, free_params, method='L-BFGS-B').fun
+            #Expected error, the likelihood function was changed and I didn't added profile params yet.
             deviance = 2*(nll_0 - self.nloglike(free_params=fitted_params))
             p_value = chi2.sf(deviance, df=1)
             CIs[i]= [lower_bound,upper_bound,p_value,deviance]
@@ -819,7 +837,6 @@ class GEVFit():
             self.fit_method = fit_method
             self.RL_args = RL_args
     def AIC(self):
-        print(self.gevSample.N_total)
         if self.fit_method.lower() != 'mle':
             warnings.warn(f"AIC is based on MLE estimation, not on '{self.fit_method}'.", UserWarning)
         return 2 * self.gevSample.nparams + 2 * (self.n_ll*1)
@@ -858,7 +875,7 @@ class GEVFit():
         """
         if self.RL_args["reparam"]:
             if T is not None:
-                logging.info(f"Since the return period (T) was specified during model initialization as T = {self.RL_args.get('T')}, it can not be modified.")
+                logging.info(f"Since the return period (T) was specified during model initialization as T = {self.RL_args.get('T')}, it can not be modified. | Your specification will be ignored.")
             return GEVReturnLevel_reparam(
                 gevFit=self,
                 t=t,
@@ -979,77 +996,6 @@ class GEVFit():
 
         return quantiles
 
-    #To be remade
-    def data_plot(self, time, toggle=None):
-        """
-        Creates a scatter plot of self.endog against the given time vector. Optionally overlays
-        quantile lines at 0.05, 0.95 (green, bold) and 0.01, 0.99 (blue, dashed) based on `self.trans` 
-        or the `toggle` parameter.
-
-        Parameters:
-        - time: Array-like, representing the x-axis values (time points).
-        - toggle (bool, optional): If provided, overrides the self.trans attribute to toggle quantile lines.
-                                If None, falls back to using self.trans.
-        """
-        if len(time) != len(self.endog):
-            raise ValueError("Length of time vector must match the length of self.endog.")
-
-        # Determine whether to show quantile lines
-        show_quantiles = toggle if toggle is not None else self.trans
-
-        # Configure matplotlib for a modern font
-        rcParams['font.family'] = 'DejaVu Sans'
-        rcParams['font.size'] = 14
-
-        # Define a consistent, aesthetically pleasing color for all points
-        point_color = '#76C7C0'
-
-        # Create the scatter plot
-        plt.figure(figsize=(12, 8))
-        plt.scatter(time, self.endog, color=point_color, alpha=0.8, edgecolors='black', linewidth=0.5)
-
-        # Plot quantile lines if toggle is True or self.trans is True
-        if show_quantiles:
-            # Compute quantiles
-            q_05 = self._gev_params_to_quantiles()(0.05)
-            q_95 = self._gev_params_to_quantiles()(0.95)
-            q_01 = self._gev_params_to_quantiles()(0.01)
-            q_99 = self._gev_params_to_quantiles()(0.99)
-
-            # Add quantile lines
-            plt.plot(time, q_05.flatten(), color='green', linewidth=2, linestyle='-', label='5th & 95th Percentiles')
-            plt.plot(time, q_95.flatten(), color='green', linewidth=2, linestyle='-')
-            plt.plot(time, q_01.flatten(), color='blue', linewidth=2, linestyle='--', label='1st & 99th Percentiles')
-            plt.plot(time, q_99.flatten(), color='blue', linewidth=2, linestyle='--')
-
-            # Add legend inside the plot
-            plt.legend(
-                fontsize=12,
-                loc='upper left',
-                frameon=True,
-                facecolor='white',
-                edgecolor='black',
-                title="Quantile Lines"
-            )
-
-        # Add plot aesthetics
-        plt.title("Block Maximum Over Time with GEV Quantiles", fontsize=18, pad=15, fontweight='normal', color='darkslategray')
-        plt.xlabel("Time", fontsize=16, labelpad=10)
-        plt.ylabel("Values", fontsize=16, labelpad=10)
-
-        # Gridlines with light styling
-        plt.grid(True, linestyle='--', linewidth=0.6, alpha=0.6)
-
-        # Custom ticks
-        plt.xticks(fontsize=14)
-        plt.yticks(fontsize=14)
-
-        # Tight layout to maximize use of space
-        plt.tight_layout()
-
-        # Show the plot
-        plt.show()
-
 class GEVReturnLevelBase(ABC):
     """
     Base class for GEV return level calculations.
@@ -1105,7 +1051,7 @@ class GEVReturnLevel(GEVReturnLevelBase):
         # Default for s: range from 0 to number of spatial points (axis 2 of exog)
         self.s = s if s is not None else list(range(self.gevFit.gevSample.endog.shape[1]))
 
-    def return_level_at(self, T, t=0, s=0, confidence=0.95):
+    def return_level_at(self, T, t, s, confidence=0.95):
         """
         Computes the return level of the Generalized Extreme Value (GEV) distribution for a given return period T.
         The confidence interval is estimated using the delta method.
@@ -1213,7 +1159,7 @@ class GEVReturnLevel(GEVReturnLevelBase):
                 "Please call set_parameters(T, t, confidence) before using summary."
             )
 
-        T = np.asarray(self.T, dtype=np.int32)
+        T = np.asarray(self.T)
         t = np.asarray(self.t, dtype=np.int32)
         s = np.asarray(self.s, dtype=np.int32)
 
@@ -1263,6 +1209,87 @@ class GEVReturnLevel(GEVReturnLevelBase):
                 "No parameters were set. Please specify at least one of `confidence`, `Return Period : T`, or `Reference time : t`.",
                 UserWarning
             )
+
+    def level_plot(self, s=None, show_ci=True, save_path=None, dpi=300):
+        """
+        Plot return level curves for each time point at a given spatial index s.
+
+        Ensures at least 20 return periods are used for smooth, scientific-quality curves.
+
+        Args:
+            s (int, optional): Spatial index. Defaults to the first in self.s.
+            show_ci (bool): Whether to show confidence intervals. Default True.
+            save_path (str, optional): If provided, saves the plot to this path.
+            dpi (int): Resolution for saving the figure (if saved).
+        """
+        # Poster-quality style
+        mpl.rcParams.update({
+            "font.size": 14,
+            "axes.labelsize": 16,
+            "axes.titlesize": 18,
+            "legend.fontsize": 12,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+            "figure.figsize": (10, 6),
+            "axes.grid": True,
+            "grid.alpha": 0.3,
+            "lines.markersize": 6,
+            "lines.linewidth": 2,
+            "legend.frameon": False
+        })
+
+        # Spatial index
+        if s is None:
+            s = self.s[0]
+        elif s not in self.s:
+            raise ValueError(f"s = {s} not in self.s")
+
+        # Use a smooth range of return periods (log-scale ideal)
+        if len(self.T) < 20:
+            T_plot = [2,10,20,50,100,150,200,500,750,1000]
+        else:
+            T_plot = np.asarray(self.T)
+
+        # Backup original T and temporarily override
+        T_orig = self.T
+        self.T = self.T  # update for summary()
+
+        # Ensure output dimension alignment
+        t_vals = np.asarray(self.t)
+        s_idx = self.s.index(s)
+
+        z_p_array, ci_lower_array, ci_upper_array = self.summary()
+
+        fig, ax = plt.subplots()
+
+        color_cycle = plt.cm.viridis(np.linspace(0, 1, len(t_vals)))
+        markers = ['o', 's', 'D', '^', 'v', 'P', '*', 'X']
+
+        for i, (t_val, color) in enumerate(zip(t_vals, color_cycle)):
+            return_levels = z_p_array[:, i, s_idx]
+            label = fr"$t = {t_val}$"
+
+            ax.plot(self.T, return_levels, label=label, color=color, marker=markers[i % len(markers)])
+
+            if show_ci:
+                lower = ci_lower_array[:, i, s_idx]
+                upper = ci_upper_array[:, i, s_idx]
+                ax.fill_between(self.T, lower, upper, color=color, alpha=0.2)
+
+        ax.set_xlabel("Return period $T$ (years)")
+        ax.set_ylabel("Return level")
+        ax.set_title(fr"Return level curves, temporal non-stationarity")
+        
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), title="Time steps")
+        fig.tight_layout()
+
+        if save_path is not None:
+            plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        else:
+            plt.show()
+
+        # Restore original T
+        self.T = T_orig
 
     def __str__(self):
         return(str(self.summary()))
@@ -1345,6 +1372,7 @@ class GEVReturnLevel_reparam(GEVReturnLevelBase):
         return(str(self.summary()))
 
 class GEV_WWA(GEV):
+      #Expected errors, the WWA function is old and derservec to be remade completely.
     def __init__(self, endog, exog=None, loc_link=None, scale_link=None, shape_link=None, **kwargs):
         super().__init__(endog, exog, loc_link, scale_link, shape_link, **kwargs)
 
@@ -1555,35 +1583,52 @@ class GEV_WWA_Fit(GEVFit):
     
 if __name__ == "__main__":
 
-    #EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
-    EOBS = pd.read_csv(r"c:\ThesisData\Blockmax\EOBS_blockmax.csv")
-    #EOBS["random_value"] = np.random.uniform(-2, 2, size=len(EOBS))
-    #EOBS["time"] = np.arange(len(EOBS))
-    #n = len(EOBS["prmax"].values.reshape(-1,1))
-    #
-    # Dummy endog variable (10 samples)
-    # tempanomalyMean
+    # ---------------------------------------------------------------
+    # 0.  Load data
+    # ---------------------------------------------------------------
+    EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
 
+    rng = np.random.default_rng(42)                     # reproducible noise
 
-   # Original single-series endog
-    endog = EOBS[["prmax"]]  # Shape: (n, 1)
-    exog = {"location": EOBS[['tempanomalyMean']],"scale": EOBS[['tempanomalyMean']]}
+    # ---------------------------------------------------------------
+    # 1.  Build a 3-series endog  --------  shape (n_obs, 3)
+    #     • Series 0: the original prmax
+    #     • Series 1 & 2: prmax ± small Gaussian noise (5 % sd)
+    # ---------------------------------------------------------------
+    y0     = EOBS["prmax"].to_numpy(dtype=float).reshape(-1, 1)   # (n,1)
+    sigma  = 1.5 * y0.std()                                      # 5 % of sd
+    noise  = rng.normal(scale=sigma, size=(y0.shape[0], 10))       # (n,2)
 
-    afit = GEVSample(endog=EOBS["prmax"],exog=exog).fit(fit_method='MLE')
-    print(afit)
-    #print(afit.exog["location"].shape)
-    #rfit = afit.fit(fit_method='mle')
-    #print(rfit)
-    #print(afit.return_level(T=[1000], t=[0,25,30,35,len(EOBS)-1]))
-    # = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog,T=50).fit(fit_method="mle")
-    #print(afit)
-    #print(afit.return_level(T=[50], t=[0,25,30,35,len(EOBS)-1]))
-    #bfit = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog, T=50).fit(fit_method="profile")
-    #print(bfit)
-    #print(bfit.return_level(t=[0,25,30,35,len(EOBS)-1]))
+    endog  = np.hstack([y0, y0 + noise])                          # (n,3)
 
-    #a2 = GEVSample(endog=EOBS["prmax"].values.reshape(-1,1),exog=exog).fit()
-    #a1.data_plot(time=EOBS["year"])
+    # ---------------------------------------------------------------
+    # 2.  Build exog shared across series  --- shape (n_obs, c, 3)
+    #     • Same value repeated for every series (no noise)
+    # ---------------------------------------------------------------
+    X_base = EOBS[["tempanomalyMean"]].to_numpy(dtype=float)      # (n, 1)
 
-    #e = a1.return_level(return_period=5,ref_year=74)
-    #a1.return_level_plot()
+    # repeat along the third axis: (n, c, 1) → (n, c, 3)
+    exog_shared = np.repeat(X_base[:, :, None], 11, axis=2)
+
+    exog = {
+        "location": exog_shared,      # (n, 1, 3)
+        "scale":    exog_shared,      # (n, 1, 3)  — same design matrix
+    }
+
+    # ---------------------------------------------------------------
+    # 3.  Sparse-random weights  ---  shape (n_obs, 3)
+    # ---------------------------------------------------------------
+    mask    = rng.random(size=endog.shape) < 0.8        # 20 % active
+    weights = rng.uniform(1e-6, 1.0, size=endog.shape)
+    weights[~mask] = 0.0
+
+    # ---------------------------------------------------------------
+    # 4.  Fit with & without weights
+    # ---------------------------------------------------------------
+    m_w = GEVSample(endog=endog, exog=exog, weights=weights).fit(fit_method="MLE")
+    print("=== With sparse weights ===")
+    print(m_w)
+
+    m_u = GEVSample(endog=endog, exog=exog).fit(fit_method="MLE")
+    print("\n=== Uniform weights (default) ===")
+    print(m_u)
