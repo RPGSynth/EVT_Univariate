@@ -132,7 +132,7 @@ class GEV(ABC):
         if weights is None:
             weights = getattr(self, "weights", None)
             if weights is None:
-                weights = np.ones_like(self.endog)      # all observations get weight 1
+                weights = np.ones_like(self.endog)    # all observations get weight 1
 
         if weights.shape != self.endog.shape:
             raise ValueError("`weights` must have shape (n_obs, n_samples).")
@@ -143,7 +143,7 @@ class GEV(ABC):
         total_weight = weights.sum()
         if total_weight == 0:
             raise ValueError("Sum of weights is zero; likelihood is undefined.")
-    
+
         full_params = params # Placeholder - needs adjustment if called directly with fixed params
 
         # Extract the number of covariates for each parameter
@@ -159,12 +159,13 @@ class GEV(ABC):
         # Shape of params_param: (n_cov_param,)
         # Result shape: (n_obs, n_samples)
         scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], scale_params))
-        print("scale = " + str(np.mean(scale)))
+
+        #print("scale = " + str(np.mean(scale)))
         if np.any(scale <= 1e-9): # Use a small epsilon instead of 0 for stability
             return 1e7 # Increased penalty
 
         shape = self.shape_link(np.einsum('nkp,k->np', self.exog['shape'], shape_params))
-        print("shape = " + str(np.mean(shape)))
+        #print("shape = " + str(np.mean(shape)))
         # Compute location parameter (mu or zp)
         if self.loc_return_level_reparam:
             if self.T is None: # Should be set if loc_return_level_reparam is True
@@ -186,15 +187,13 @@ class GEV(ABC):
                     zp + scale * (1 - y_p**(-shape)) / shape # GEV inversion: zp = mu + scale/shape * ((-log(1-1/T))**(-shape) - 1) -> mu = zp - scale/shape * (yp**(-shape) - 1) **ERROR in original code** -> mu = zp + scale/shape * (1 - yp**(-shape)). Original was correct.
                  )
 
-            # Check for non-finite location values resulting from calculation
-            if np.any(~np.isfinite(location)):
-                return 1e7
         else:
             # Standard location parameter calculation
             location = self.loc_link(np.einsum('nip,i->np', self.exog['location'], loc_params))
-            print("loc = " + str(np.mean(location)))
-            if np.any(~np.isfinite(location)):
-                 return 1e7
+            #print("loc = " + str(np.mean(location)))
+        
+        if np.any(~np.isfinite(location)):
+            return 1e7
 
 
         # GEV transformation using calculated location, scale, shape
@@ -206,7 +205,7 @@ class GEV(ABC):
 
         # Check for invalid values: 1 + xi * (y - mu) / sigma > 0 for xi != 0
         # This check should technically be done *before* log/power operations
-        invalid_gev_domain =  (weights > 0) & (~is_gumbel) & (transformed_data <= 1e-9) # Use epsilon
+        invalid_gev_domain =  (weights > 0) & np.any(scale <= 0) & (~is_gumbel) & (transformed_data <= 1e-9) # Use epsilon
         if np.any(invalid_gev_domain):
              return 1e7
 
@@ -234,15 +233,14 @@ class GEV(ABC):
         if not np.all(np.isfinite(n_ll_terms)):
              # This catches issues like exp() overflow or log(neg) etc. that weren't caught by domain checks
             return 1e7
-
+        
         # Total negative log-likelihood (sum over all observations and samples)
-        avg_nll = np.sum(n_ll_terms)
+        avg_nll = np.sum(n_ll_terms * weights)/total_weight
 
         # Final check if total NLL is finite
         if not np.isfinite(avg_nll):
              return 1e8 # Return even larger penalty if sum somehow becomes non-finite
-        
-        print(avg_nll)
+
         return avg_nll
 
     def loglike(self, params: np.ndarray) -> float:
@@ -707,8 +705,8 @@ class GEVSample(GEV):
               f"  Suggestion: Verify your `start_params` and/or provide manual initial guesses (especially intercepts) in the start_params attribute of the fit method.", RuntimeWarning)
         mle_params = self.result.x
 
-        hessian_func = nd.Hessian(self.nloglike)
-        H_bar        = hessian_func(mle_params) 
+        hessian_func = nd.Hessian(self.nloglike) 
+        H_bar        = hessian_func(mle_params)  
 
         if getattr(self, "weights", None) is None:
             total_weight = self.endog.size          # all weights = 1
@@ -717,12 +715,12 @@ class GEVSample(GEV):
 
         # 3-b)  Invert with small ridge in case of near-singularity
         try:
-            cov_matrix = np.linalg.inv(H_bar)
+            cov_matrix = np.linalg.inv(H_bar)/ total_weight
         except np.linalg.LinAlgError:
             print("WOOOOOO")
             # add 1e-6 * I ridge to the Hessian and retry
-            ridge      = 1e-6 * np.eye(H_bar.shape[0])
-            cov_matrix = np.linalg.inv(H_bar + ridge)
+            #ridge      = 1e-6 * np.eye(H_bar.shape[0])
+            #cov_matrix = np.linalg.inv(H_bar + ridge)
 
         fitted_loc = self.loc_link(np.einsum('nip,i->np', self.exog['location'], self.result.x[:i]))
         fitted_scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], self.result.x[i:i+j]))
@@ -1120,7 +1118,8 @@ class GEVReturnLevel(GEVReturnLevelBase):
         if np.isclose(xi_t, 0):
             d_zp_d_mu = 1
             d_zp_d_sigma = -np.log(y_p)
-            d_zp_d_xi = 0
+            #d_zp_d_xi = 0 ?? 
+            d_zp_d_xi = 0.5 * sigma_t * (np.log(y_p))**2
         else:
             temp = y_p ** (-xi_t)
             d_zp_d_mu = 1
@@ -1210,56 +1209,72 @@ class GEVReturnLevel(GEVReturnLevelBase):
                 UserWarning
             )
 
-    def level_plot(self, s=None, show_ci=True, save_path=None, dpi=300):
+    def time_plot(
+        self,
+        s=None,
+        show_ci=True,
+        save_path=None,
+        dpi=300,
+        title=None,
+        ylabel=None,
+        year_offset=1950,
+        manual_params=None,          # <-- NEW
+    ):
         """
-        Plot return level curves for each time point at a given spatial index s.
+        Plot return-level curves for each time point at a given spatial index *s*.
 
-        Ensures at least 20 return periods are used for smooth, scientific-quality curves.
+        [...]
+        manual_params : array-like, shape (3, n) or (n, 3), optional
+            One or more GEV parameter triples ``[μ, σ, ξ]`` to be drawn as
+            dotted-red reference curves.  For example::
 
-        Args:
-            s (int, optional): Spatial index. Defaults to the first in self.s.
-            show_ci (bool): Whether to show confidence intervals. Default True.
-            save_path (str, optional): If provided, saves the plot to this path.
-            dpi (int): Resolution for saving the figure (if saved).
+                manual_params = [[μ1, σ1, ξ1],
+                                [μ2, σ2, ξ2]]
+
+            If *None* (default), no reference curves are added.
         """
-        # Poster-quality style
+
+        def _gev_return_level(mu, sigma, xi, T_vals):
+            """
+            Return level z(T) of a GEV distribution for the return period axis `T_vals`.
+            """
+            p = 1.0 / T_vals  # exceedance probability
+            if np.isclose(xi, 0.0):
+                # Gumbel limit (ξ → 0)
+                return mu - sigma * np.log(-np.log(1.0 - p))
+            else:
+                return mu + (sigma / xi) * ((-np.log(1.0 - p)) ** (-xi) - 1.0)
+
+        # ------------------------- Style -----------------------------------
         mpl.rcParams.update({
-            "font.size": 14,
-            "axes.labelsize": 16,
-            "axes.titlesize": 18,
-            "legend.fontsize": 12,
-            "xtick.labelsize": 12,
-            "ytick.labelsize": 12,
+            "font.size": 11,
+            "axes.labelsize": 11,
+            "axes.titlesize": 13,
+            "legend.fontsize": 11,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
             "figure.figsize": (10, 6),
             "axes.grid": True,
             "grid.alpha": 0.3,
             "lines.markersize": 6,
             "lines.linewidth": 2,
-            "legend.frameon": False
+            "legend.frameon": False,
         })
 
-        # Spatial index
+        # ------------------ Spatial index handling -------------------------
         if s is None:
             s = self.s[0]
         elif s not in self.s:
             raise ValueError(f"s = {s} not in self.s")
 
-        # Use a smooth range of return periods (log-scale ideal)
-        if len(self.T) < 20:
-            T_plot = [2,10,20,50,100,150,200,500,750,1000]
-        else:
-            T_plot = np.asarray(self.T)
-
-        # Backup original T and temporarily override
-        T_orig = self.T
-        self.T = self.T  # update for summary()
-
-        # Ensure output dimension alignment
-        t_vals = np.asarray(self.t)
-        s_idx = self.s.index(s)
+        # ---------------------- Data preparation ---------------------------
+        T_vals = np.asarray(self.T)            # return-period axis
+        t_vals = np.asarray(self.t)            # time-step axis
+        s_idx  = self.s.index(s)               # spatial index
 
         z_p_array, ci_lower_array, ci_upper_array = self.summary()
 
+        # -------------------------- Plotting -------------------------------
         fig, ax = plt.subplots()
 
         color_cycle = plt.cm.viridis(np.linspace(0, 1, len(t_vals)))
@@ -1267,29 +1282,61 @@ class GEVReturnLevel(GEVReturnLevelBase):
 
         for i, (t_val, color) in enumerate(zip(t_vals, color_cycle)):
             return_levels = z_p_array[:, i, s_idx]
-            label = fr"$t = {t_val}$"
+            legend_year   = int(t_val) + 0
+            legend_label  = fr"$t = {legend_year}$"
 
-            ax.plot(self.T, return_levels, label=label, color=color, marker=markers[i % len(markers)])
+            ax.plot(
+                T_vals,
+                return_levels,
+                label=legend_label,
+                color=color,
+                marker=markers[i % len(markers)]
+            )
 
             if show_ci:
                 lower = ci_lower_array[:, i, s_idx]
                 upper = ci_upper_array[:, i, s_idx]
-                ax.fill_between(self.T, lower, upper, color=color, alpha=0.2)
+                ax.fill_between(T_vals, lower, upper, color=color, alpha=0.2)
 
-        ax.set_xlabel("Return period $T$ (years)")
-        ax.set_ylabel("Return level")
-        ax.set_title(fr"Return level curves, temporal non-stationarity")
-        
-        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), title="Time steps")
+        # ------------- Optional manual reference lines (dotted red) --------
+        if manual_params is not None:
+            params = np.asarray(manual_params, dtype=float)
+            # Accept (3, n) or (n, 3)
+            if params.shape[0] == 3 and params.ndim == 2:
+                params = params.T
+            elif params.shape[1] != 3:
+                raise ValueError(
+                    "`manual_params` must have shape (3, n) or (n, 3); "
+                    f"got {params.shape}"
+                )
+
+            for j, (mu, sigma, xi) in enumerate(params):
+                z_manual = _gev_return_level(mu, sigma, xi, T_vals)
+                ax.plot(
+                    T_vals,
+                    z_manual,
+                    linestyle=':',
+                    linewidth=2,
+                    color='red',
+                    label=f"Reference {j+1}"
+                )
+
+        # ----------------------- Labels & title ----------------------------
+        ax.set_xlabel("Return period (years)")
+        ax.set_ylabel("Return level (mm/day)" if ylabel is None else ylabel)
+
+        default_title = "Return-level curves for selected reference years"
+        ax.set_title(default_title if title is None else title)
+
+        # Legend outside the plot area
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), title="Legend")
         fig.tight_layout()
 
+        # ----------------------- Output ------------------------------------
         if save_path is not None:
             plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
         else:
             plt.show()
-
-        # Restore original T
-        self.T = T_orig
 
     def __str__(self):
         return(str(self.summary()))
@@ -1581,54 +1628,76 @@ class GEV_WWA_Fit(GEVFit):
 
 
     
+
 if __name__ == "__main__":
-
-    # ---------------------------------------------------------------
-    # 0.  Load data
-    # ---------------------------------------------------------------
+    from scipy.stats import genextreme as gev 
+    # ------------------------------------------------------------------
+    # 0.  Load a reference file (only for n_obs and a scale benchmark)
+    # ------------------------------------------------------------------
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
+    rng   = np.random.default_rng(10)               # reproducible generator
 
-    rng = np.random.default_rng(42)                     # reproducible noise
+    # ------------------------------------------------------------------
+    # 1.  Dimensions & parameter ranges
+    # ------------------------------------------------------------------
+    n_obs     = len(EOBS)           # same number of time steps
+    p_series  = 9                # how many independent locations
+    mu_range  = (2, 100)         # μ  ∈ [0, 40]
+    sig_range = (10.0, 50)        # σ  ∈ [10, 40]
+    xi_range  = (-0.1, 0.5)         # ξ  ∈ [–0.3, 0.3]
 
-    # ---------------------------------------------------------------
-    # 1.  Build a 3-series endog  --------  shape (n_obs, 3)
-    #     • Series 0: the original prmax
-    #     • Series 1 & 2: prmax ± small Gaussian noise (5 % sd)
-    # ---------------------------------------------------------------
-    y0     = EOBS["prmax"].to_numpy(dtype=float).reshape(-1, 1)   # (n,1)
-    sigma  = 1.5 * y0.std()                                      # 5 % of sd
-    noise  = rng.normal(scale=sigma, size=(y0.shape[0], 10))       # (n,2)
+    # ------------------------------------------------------------------
+    # 2.  Generate the endogenous block  ----  shape (n_obs, p_series)
+    # ------------------------------------------------------------------
+    mu_vec  = rng.uniform(*mu_range,  size=p_series)
+    sig_vec = rng.uniform(*sig_range, size=p_series)
+    xi_vec  = rng.uniform(*xi_range,  size=p_series)
 
-    endog  = np.hstack([y0, y0 + noise])                          # (n,3)
+    endog_data = np.empty((n_obs, p_series), dtype=float)
+    for s in range(p_series):
+        c = -xi_vec[s]                                # SciPy’s c = –ξ
+        rv = gev(c, loc=mu_vec[s], scale=sig_vec[s])
+        endog_data[:, s] = rv.rvs(size=n_obs, random_state=rng)
 
-    # ---------------------------------------------------------------
-    # 2.  Build exog shared across series  --- shape (n_obs, c, 3)
-    #     • Same value repeated for every series (no noise)
-    # ---------------------------------------------------------------
-    X_base = EOBS[["tempanomalyMean"]].to_numpy(dtype=float)      # (n, 1)
+    # ------------------------------------------------------------------
+    # 3.  Build an independent exogenous block  ----  shape (n_obs, 1, p)
+    #     (here a single covariate, independent N(0,1) then rescaled)
+    # ------------------------------------------------------------------
+    base_min, base_max = EOBS["tempanomalyMean"].min(), EOBS["tempanomalyMean"].max()
+    width              = base_max - base_min
 
-    # repeat along the third axis: (n, c, 1) → (n, c, 3)
-    exog_shared = np.repeat(X_base[:, :, None], 11, axis=2)
+    exog_data = rng.normal(size=(n_obs, 1, p_series))
+    exog_data = base_min + 0.5 * width * exog_data     # same ballpark scale
 
-    exog = {
-        "location": exog_shared,      # (n, 1, 3)
-        "scale":    exog_shared,      # (n, 1, 3)  — same design matrix
+    exog_multi = {"location": exog_data, "scale": None, "shape": None}
+
+    # ------------------------------------------------------------------
+    # 4.  Fit the multi-series model
+    # ------------------------------------------------------------------
+    model_multi = GEVSample(endog=endog_data, exog=exog_multi)
+    res_multi   = model_multi.fit(fit_method="MLE")
+
+    print("=== MULTI-SERIES (100 independent GEV locations) ===")
+    print("endog shape :", model_multi.endog.shape)            # (n, 100)
+    print("exog shape  :", model_multi.exog["location"].shape) # (n, 1, 100)
+    print(res_multi, "\n")
+
+    # ------------------------------------------------------------------
+    # 5.  Single-series benchmark (original prmax vs. tempanomaly)
+    # ------------------------------------------------------------------
+    endog_single = EOBS[["prmax"]].to_numpy()        # (n, 1)
+    exog_single  = {
+        "location": EOBS[["tempanomalyMean"]].to_numpy()[:, None, :]
     }
 
-    # ---------------------------------------------------------------
-    # 3.  Sparse-random weights  ---  shape (n_obs, 3)
-    # ---------------------------------------------------------------
-    mask    = rng.random(size=endog.shape) < 0.8        # 20 % active
-    weights = rng.uniform(1e-6, 1.0, size=endog.shape)
-    weights[~mask] = 0.0
-
-    # ---------------------------------------------------------------
-    # 4.  Fit with & without weights
-    # ---------------------------------------------------------------
-    m_w = GEVSample(endog=endog, exog=exog, weights=weights).fit(fit_method="MLE")
-    print("=== With sparse weights ===")
-    print(m_w)
-
-    m_u = GEVSample(endog=endog, exog=exog).fit(fit_method="MLE")
-    print("\n=== Uniform weights (default) ===")
-    print(m_u)
+    manual = [
+    [69, 13,  0.1],   # μ, σ, ξ for line 1
+    [69, 5.0, 0.1],   # μ, σ, ξ for line 2
+    ]
+    
+    model_single = GEVSample(endog=endog_single, exog=exog_single)
+    res_single   = model_single.fit(fit_method="MLE")
+    print(res_single)
+    res_single.return_level(T=[10,50,100],t=[0,20,50,74]).time_plot(manual_params=manual)
+    #print("=== SINGLE-SERIES (original data) ===")
+    #print(res_single)
