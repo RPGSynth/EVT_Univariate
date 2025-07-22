@@ -10,22 +10,43 @@ from sklearn.linear_model import LinearRegression
 from functools import partial
 import matplotlib.pyplot as plt
 import os
+from matplotlib.animation import FuncAnimation
 
 # --- JAX Setup ---
 key = jax.random.PRNGKey(0)
+# Set JAX traceback filtering to 'off' to get more detailed error messages.
 os.environ['JAX_TRACEBACK_FILTERING'] = 'off'
-DIST_EPSILON = 1e-7
+DIST_EPSILON = 1e-8 # A small constant to prevent division by zero or log(0).
 
 # ==============================================================================
 # SECTION 1: DATA PREPARATION & UTILITIES
 # ==============================================================================
 
+# --- K-Nearest Neighbors Hyperparameter ---
+K_NEIGHBORS = 300 # The number of nearest neighbors to consider for each point.
+
 def calculate_distances(point_locs, reference_locs):
-    """Calculates the Euclidean distance matrix between two sets of locations."""
-    return jnp.sqrt(jnp.sum((point_locs[:, jnp.newaxis] - reference_locs[jnp.newaxis, :])**2, axis=-1))
+    """Calculates the Euclidean distance matrix between two sets of points."""
+    # Broadcasting to compute pairwise distances: (n, 1, d) - (1, m, d) -> (n, m, d)
+    return jnp.sqrt(jnp.sum((point_locs[:, jnp.newaxis, :] - reference_locs[jnp.newaxis, :, :])**2, axis=-1))
+
+# --- K-Nearest Neighbors Function ---
+@partial(jax.jit, static_argnums=(2,))
+def find_knn(query_locs, reference_locs, k):
+    """
+    Finds the k-nearest neighbors for each query point from a set of reference points.
+    Uses jax.lax.top_k for efficiency, which is much faster than a full sort.
+    """
+    all_dists = calculate_distances(query_locs, reference_locs)
+    # We use top_k on the *negative* distances. The largest negative distances
+    # correspond to the smallest positive distances.
+    neg_dists = -all_dists
+    top_k_neg_dists, top_k_indices = jax.lax.top_k(neg_dists, k=k)
+    # Return the positive distances and the indices of the neighbors.
+    return -top_k_neg_dists, top_k_indices
 
 def calculate_ols_coefficients(x_train, y_train):
-    """Calculates global OLS coefficients for mu and log(sigma^2)."""
+    """Calculates global OLS coefficients to serve as a baseline."""
     x_train_intercept = np.concatenate([np.ones((x_train.shape[0], 1)), x_train], axis=1)
     ols_mu_model = LinearRegression(fit_intercept=False).fit(x_train_intercept, y_train)
     mu_coeffs = ols_mu_model.coef_
@@ -37,13 +58,13 @@ def calculate_ols_coefficients(x_train, y_train):
     global_coeffs = np.concatenate([mu_coeffs, sigma_coeffs])
     return jnp.array(mu_coeffs), jnp.array(sigma_coeffs), jnp.array(global_coeffs)
 
-def get_simulated_data(n_samples=200, key_data=jax.random.PRNGKey(123), **kwargs):
-    """Generates complex simulated data with non-stationary properties."""
-    config = {'x_minval': -2 * jnp.pi, 'x_maxval': 2 * jnp.pi, 'curve_type': 'sin', 'amplitude': 0, 'frequency': 1.0, 'phase': 0.0, 'vertical_offset': 0.5, 'x_slope_coeff': 1.0, 'noise_y_std': 0.3, 'noise_beta0_std': 0.5, 'noise_beta1_std': 0.05, 'noise_type': 'wavy'}
+def get_simulated_data(n_samples=5000, key_data=jax.random.PRNGKey(123), **kwargs):
+    """Generates simulated data with non-stationary properties."""
+    config = {'x_minval': -2 * jnp.pi, 'x_maxval': 2 * jnp.pi, 'curve_type': 'sin', 'amplitude': 1.5, 'frequency': 1.0, 'phase': 0.0, 'vertical_offset': 0.5, 'x_slope_coeff': 1.0, 'noise_y_std': 0.3, 'noise_beta0_std': 0.5, 'noise_beta1_std': 0.05, 'noise_type': 'wavy'}
     config.update(kwargs)
     key_beta0, key_beta1, key_y_noise = jax.random.split(key_data, 3)
     X_features = jnp.linspace(config['x_minval'], config['x_maxval'], n_samples).reshape(-1, 1)
-    locs = X_features
+    locs = X_features # Using features as locations
     main_curve = config['amplitude'] * jnp.sin(config['frequency'] * locs.flatten() + config['phase'])
     beta0_noise = jax.random.normal(key_beta0, (n_samples,)) * config['noise_beta0_std']
     beta0_values = config['vertical_offset'] + main_curve + beta0_noise
@@ -59,14 +80,9 @@ def get_simulated_data(n_samples=200, key_data=jax.random.PRNGKey(123), **kwargs
     return (np.array(locs), np.array(X_features), np.array(y))
 
 # --- Data Preparation ---
-locs, X, y = get_simulated_data(n_samples=300, noise_y_std=0.9, x_slope_coeff=1.2)
+locs, X, y = get_simulated_data(n_samples=700, noise_y_std=0.5, x_slope_coeff=0.9)
 locs_train_val, locs_test, X_train_val, X_test, y_train_val, y_test = train_test_split(locs, X, y, test_size=0.20, random_state=42)
 locs_train, locs_val, X_train, X_val, y_train, y_val = train_test_split(locs_train_val, X_train_val, y_train_val, test_size=0.25, random_state=42)
-
-# --- Sort the Training Data by Location for efficient lookup ---
-print("Sorting training data by x-coordinate for intuitive indexing...")
-sort_indices = np.argsort(locs_train.flatten())
-locs_train, X_train, y_train = locs_train[sort_indices], X_train[sort_indices], y_train[sort_indices]
 
 scaler_X = StandardScaler()
 X_train_scaled = scaler_X.fit_transform(X_train)
@@ -75,9 +91,16 @@ X_train_jax, y_train_jax = jnp.array(X_train_scaled), jnp.array(y_train)
 X_val_jax, y_val_jax = jnp.array(X_val_scaled), jnp.array(y_val)
 locs_train_jax, locs_val_jax = jnp.array(locs_train), jnp.array(locs_val)
 
-train_dist_matrix = calculate_distances(locs_train_jax, locs_train_jax)
-swnn_input_dist_mean = jnp.mean(train_dist_matrix)
-swnn_input_dist_std = jnp.std(train_dist_matrix)
+# --- Pre-compute the (N, K) nearest neighbors matrix before training ---
+print(f"Pre-computing the (N, K) nearest neighbors matrix for the entire training set...")
+precomputed_knn_dists, precomputed_knn_indices = find_knn(locs_train_jax, locs_train_jax, K_NEIGHBORS)
+print("KNN distance and index matrices computed.")
+
+# --- Calculate distance stats from the pre-computed matrix ---
+swnn_input_dist_mean = jnp.mean(precomputed_knn_dists)
+swnn_input_dist_std = jnp.std(precomputed_knn_dists)
+print(f"Distance stats for k-NN: Mean={swnn_input_dist_mean:.4f}, Std={swnn_input_dist_std:.4f}")
+
 _, _, global_ols_coeffs = calculate_ols_coefficients(X_train_scaled, y_train)
 
 # ==============================================================================
@@ -87,9 +110,10 @@ print("\n--- Training Teacher Model (CoefficientAdapterNet) ---")
 
 class CoefficientAdapterNet(nn.Module):
     num_outputs: int
-    hidden_dims: tuple = (64, 32)
+    hidden_dims: tuple = (64,32)
     @nn.compact
     def __call__(self, x, train: bool):
+        # The input `x` is now the vector of k-nearest neighbor distances
         for i, h_dim in enumerate(self.hidden_dims):
             x = nn.Dense(features=h_dim, name=f'hidden_dense_{i}')(x)
             x = nn.PReLU()(x)
@@ -99,75 +123,96 @@ class GNNWRTrainState(train_state.TrainState):
     batch_stats: dict
 
 def nll_loss(mu_pred, sigma_pred, targets):
-    """Negative Log-Likelihood loss for a Gaussian distribution."""
-    return jnp.mean(0.5 * jnp.log(2 * jnp.pi * sigma_pred**2) + (targets - mu_pred)**2 / (2 * sigma_pred**2))
+    """Negative Log-Likelihood loss for Gaussian distribution."""
+    safe_sigma = sigma_pred + DIST_EPSILON
+    return jnp.mean(0.5 * jnp.log(2 * jnp.pi * safe_sigma**2) + ((targets - mu_pred)**2 / (2 * safe_sigma**2)))
 
-@partial(jax.jit, static_argnums=(3, 6))
-def gnnwr_predict(model_params, model_batch_stats, dists_to_locs, apply_fn,
-                  x_batch, global_ols_coeffs, is_training: bool, swnn_input_dist_mean,
-                  swnn_input_dist_std):
-    """Performs prediction for the teacher model."""
+# --- Prediction function still uses on-the-fly k-NN for flexibility ---
+@partial(jax.jit, static_argnums=(3, 6, 10))
+def gnnwr_predict(model_params, model_batch_stats, query_locs, apply_fn,
+                  x_batch, global_ols_coeffs, is_training: bool,
+                  reference_locs, swnn_input_dist_mean, swnn_input_dist_std, k: int):
+    """Makes predictions using the k-NN based GNNWR model."""
+    knn_dists, _ = find_knn(query_locs, reference_locs, k)
+    standardized_dists = (knn_dists - swnn_input_dist_mean) / (swnn_input_dist_std + DIST_EPSILON)
     x_intercept = jnp.concatenate([jnp.ones((x_batch.shape[0], 1)), x_batch], axis=1)
-    standardized_dists = (dists_to_locs - swnn_input_dist_mean) / (swnn_input_dist_std + DIST_EPSILON)
     model_vars = {'params': model_params, 'batch_stats': model_batch_stats}
     modulation_factors = apply_fn(model_vars, standardized_dists, train=is_training)
     if isinstance(modulation_factors, tuple): modulation_factors, _ = modulation_factors
-    
     local_mu_coeffs = modulation_factors[:, :2] * global_ols_coeffs[:2]
     local_log_sigma2_coeffs = modulation_factors[:, 2:] * global_ols_coeffs[2:]
-    
     mu_pred = jnp.sum(x_intercept * local_mu_coeffs, axis=1)
     log_sigma2_pred = jnp.sum(x_intercept * local_log_sigma2_coeffs, axis=1)
+    log_sigma2_pred = jnp.clip(log_sigma2_pred, a_min=-15.0, a_max=15.0)
     sigma_pred = jnp.exp(0.5 * log_sigma2_pred)
-    
     local_coeffs = jnp.concatenate([local_mu_coeffs, local_log_sigma2_coeffs], axis=1)
     return mu_pred, sigma_pred, local_coeffs
 
+# --- Training step now uses pre-computed k-NN distances ---
 @partial(jax.jit, static_argnames=('adapter_net_apply_fn',))
-def train_step_teacher(state: GNNWRTrainState, x_batch, locs_batch, y_batch,
-                 all_train_locs, global_ols_coeffs, adapter_net_apply_fn,
-                 dropout_key, swnn_input_dist_mean, swnn_input_dist_std):
-    """A single training step for the teacher model."""
+def train_step(state: GNNWRTrainState, x_batch, knn_dists_batch, y_batch,
+               global_ols_coeffs, adapter_net_apply_fn,
+               dropout_key, swnn_input_dist_mean, swnn_input_dist_std):
+    """Performs a single training step using pre-computed k-NN distances."""
     def loss_fn(model_params):
-        dists = calculate_distances(locs_batch, all_train_locs)
-        mu_pred, sigma_pred, _ = gnnwr_predict(
-            model_params, state.batch_stats, dists, adapter_net_apply_fn,
-            x_batch, global_ols_coeffs, is_training=True,
-            swnn_input_dist_mean=swnn_input_dist_mean, swnn_input_dist_std=swnn_input_dist_std
+        model_vars = {'params': model_params, 'batch_stats': state.batch_stats}
+        standardized_dists = (knn_dists_batch - swnn_input_dist_mean) / (swnn_input_dist_std + DIST_EPSILON)
+        x_intercept = jnp.concatenate([jnp.ones((x_batch.shape[0], 1)), x_batch], axis=1)
+        modulation_factors, new_model_state = adapter_net_apply_fn(
+            model_vars, standardized_dists, train=True, mutable=['batch_stats'], rngs={'dropout': dropout_key}
         )
+        mu_pred = jnp.sum(x_intercept * (modulation_factors[:, :2] * global_ols_coeffs[:2]), axis=1)
+        log_sigma2_pred = jnp.sum(x_intercept * (modulation_factors[:, 2:] * global_ols_coeffs[2:]), axis=1)
+        log_sigma2_pred = jnp.clip(log_sigma2_pred, a_min=-15.0, a_max=15.0)
+        sigma_pred = jnp.exp(0.5 * log_sigma2_pred)
         loss = nll_loss(mu_pred, sigma_pred, y_batch)
-        return loss
-    
-    loss_val, grads = jax.value_and_grad(loss_fn)(state.params)
-    return state.apply_gradients(grads=grads), loss_val
+        return loss, new_model_state['batch_stats']
 
-# --- Teacher model training loop ---
+    (loss_val, new_batch_stats), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    return state.apply_gradients(grads=grads).replace(batch_stats=new_batch_stats), loss_val
+
 adapter_net = CoefficientAdapterNet(num_outputs=len(global_ols_coeffs))
 key, key_init, key_dropout = jax.random.split(key, 3)
-model_variables = adapter_net.init(key_init, jax.random.normal(key_init, (1, locs_train_jax.shape[0])), train=False)
+dummy_input = jax.random.normal(key_init, (1, K_NEIGHBORS))
+model_variables = adapter_net.init(key_init, dummy_input, train=False)
+
+optimizer = optax.chain(
+    optax.clip_by_global_norm(1.0),
+    optax.adam(learning_rate=0.0005)
+)
 teacher_state = GNNWRTrainState.create(
     apply_fn=adapter_net.apply, params=model_variables['params'],
-    tx=optax.adam(learning_rate=0.001), batch_stats=model_variables.get('batch_stats', {})
+    tx=optimizer, batch_stats=model_variables.get('batch_stats', {})
 )
 
-epochs, batch_size, patience, best_val_loss, patience_counter = 500, 64, 10, float('inf'), 0
+epochs, batch_size, patience, best_val_loss, patience_counter = 1000, 5000, 100, float('inf'), 0
 for epoch in range(epochs):
     key, key_shuffle = jax.random.split(key)
     perm = jax.random.permutation(key_shuffle, X_train_jax.shape[0])
-    X_train_s, y_train_s, locs_train_s = X_train_jax[perm], y_train_jax[perm], locs_train_jax[perm]
+    X_train_s, y_train_s, knn_dists_s = X_train_jax[perm], y_train_jax[perm], precomputed_knn_dists[perm]
     
     epoch_train_loss = 0.0
-    for i in range(int(np.ceil(X_train_s.shape[0] / batch_size))):
+    num_batches = int(np.ceil(X_train_s.shape[0] / batch_size))
+    for i in range(num_batches):
         start_idx, end_idx = i * batch_size, (i + 1) * batch_size
-        x_b, l_b, y_b = X_train_s[start_idx:end_idx], locs_train_s[start_idx:end_idx], y_train_s[start_idx:end_idx]
+        x_b, y_b, knn_dists_b = X_train_s[start_idx:end_idx], y_train_s[start_idx:end_idx], knn_dists_s[start_idx:end_idx]
         key, step_key = jax.random.split(key)
-        teacher_state, loss_item = train_step_teacher(teacher_state, x_b, l_b, y_b, locs_train_jax, global_ols_coeffs, adapter_net.apply, step_key, swnn_input_dist_mean, swnn_input_dist_std)
-        epoch_train_loss += loss_item.item()
         
-    avg_epoch_train_loss = epoch_train_loss / (i+1)
+        teacher_state, loss_item = train_step(
+            teacher_state, x_b, knn_dists_b, y_b, global_ols_coeffs,
+            adapter_net.apply, step_key, swnn_input_dist_mean, swnn_input_dist_std
+        )
+        epoch_train_loss += loss_item.item()
+
+        if jnp.isnan(loss_item) or jnp.isinf(loss_item):
+            print(f"\n!!! Training stopped at epoch {epoch+1}, batch {i+1} due to NaN/inf loss. !!!")
+            break
+    if jnp.isnan(loss_item) or jnp.isinf(loss_item): break
+
+    avg_epoch_train_loss = epoch_train_loss / num_batches
     if (epoch + 1) % 10 == 0:
-      print(f"Teacher | Epoch {epoch+1:03d} | NLL Loss: {avg_epoch_train_loss:.6f}")
-    
+        print(f"Teacher | Epoch {epoch+1:03d} | NLL Loss: {avg_epoch_train_loss:.6f}")
+
     if avg_epoch_train_loss < best_val_loss:
         best_val_loss, best_teacher_state, patience_counter = avg_epoch_train_loss, teacher_state, 0
     else:
@@ -179,316 +224,270 @@ for epoch in range(epochs):
 # ==============================================================================
 # SECTION 3: DIAGNOSTIC PLOTS FOR THE TEACHER MODEL
 # ==============================================================================
+# This section is commented out to speed up execution for focusing on the student model.
+# You can uncomment it to verify the teacher model's performance.
 print("\n--- Generating Diagnostic Plots for Trained Teacher ---")
 plt.style.use('seaborn-v0_8-whitegrid')
-
-# --- Generate predictions for the entire dataset for plotting ---
 X_all_scaled = scaler_X.transform(X)
-X_all_jax = jnp.array(X_all_scaled)
-locs_all_jax = jnp.array(locs)
-dists_all_to_train = calculate_distances(locs_all_jax, locs_train_jax)
-
-mu_all, sigma_all, local_coeffs_all = gnnwr_predict(
-    best_teacher_state.params, best_teacher_state.batch_stats, dists_all_to_train,
-    adapter_net.apply, X_all_jax, global_ols_coeffs, is_training=False,
-    swnn_input_dist_mean=swnn_input_dist_mean, swnn_input_dist_std=swnn_input_dist_std
+X_all_jax, locs_all_jax = jnp.array(X_all_scaled), jnp.array(locs)
+mu_all, sigma_all, _ = gnnwr_predict(
+    best_teacher_state.params, best_teacher_state.batch_stats,
+    query_locs=locs_all_jax, apply_fn=adapter_net.apply, x_batch=X_all_jax,
+    global_ols_coeffs=global_ols_coeffs, is_training=False, reference_locs=locs_train_jax,
+    swnn_input_dist_mean=swnn_input_dist_mean, swnn_input_dist_std=swnn_input_dist_std, k=K_NEIGHBORS
 )
-
-# --- Plot 1: Predictions with Uncertainty Bands ---
 plt.figure(figsize=(12, 7))
+sorted_indices_all = np.argsort(X[:, 0])
 plt.scatter(X[:, 0], y, label='Data Points', alpha=0.3, s=20, color='gray')
-plt.plot(X[:, 0], mu_all, label='Predicted Mean (μ)', color='firebrick', linewidth=2.5)
-plt.fill_between(X[:, 0], mu_all - 2 * sigma_all, mu_all + 2 * sigma_all,
+plt.plot(X[sorted_indices_all, 0], mu_all[sorted_indices_all], label='Predicted Mean (μ)', color='firebrick', linewidth=2.5)
+plt.fill_between(X[sorted_indices_all, 0], 
+                 (mu_all - 2 * sigma_all)[sorted_indices_all], 
+                 (mu_all + 2 * sigma_all)[sorted_indices_all],
                  color='firebrick', alpha=0.2, label='Uncertainty (±2σ)')
 plt.title('Teacher Model: Predictions with Uncertainty', fontsize=16)
 plt.xlabel('Feature X (Location)'), plt.ylabel('Target y'), plt.legend()
-plt.tight_layout()
-plt.show()
-
-# --- Plot 2: Visualization of Local Linear Models ---
-plt.figure(figsize=(12, 7))
-plt.scatter(X[:, 0], y, alpha=0.3, s=20, color='gray')
-plt.plot(X[:, 0], mu_all, color='firebrick', linewidth=2.5, label='Predicted Mean (μ)')
-
-n_local_lines = 80
-indices_to_plot = np.linspace(0, len(X) - 1, n_local_lines, dtype=int)
-for idx in indices_to_plot:
-    x_center = X[idx, 0]
-    beta0, beta1 = local_coeffs_all[idx, 0], local_coeffs_all[idx, 1]
-    # Create a small range around the center point for the local line
-    x_range = np.linspace(x_center - 0.5, x_center + 0.5, 2)
-    # The coefficients were trained on scaled data, so we must scale our x_range for prediction
-    y_line = beta0 + beta1 * scaler_X.transform(x_range.reshape(-1, 1)).flatten()
-    plt.plot(x_range, y_line, color='navy', alpha=0.5, linestyle='-')
-
-plt.title('Teacher Model: Learned Local Linear Models', fontsize=16)
-plt.xlabel('Feature X (Location)'), plt.ylabel('Target y'), plt.legend()
-plt.tight_layout()
-plt.show()
-
+plt.tight_layout(), plt.show()
 
 # ==============================================================================
-# SECTION 4: GENERATE TARGETS FROM THE TRAINED TEACHER
+# SECTION 4: GENERATE TARGET PARAMETERS FROM THE TRAINED TEACHER
 # ==============================================================================
-print("\n--- Generating Target Values and Coefficients from Trained Teacher ---")
-dists_train_to_train = calculate_distances(locs_train_jax, locs_train_jax)
-
-# Use the prediction function to get mu, sigma, and coeffs for the entire training set
-teacher_mu_train, teacher_sigma_train, teacher_coeffs_train = gnnwr_predict(
-    best_teacher_state.params, best_teacher_state.batch_stats, dists_train_to_train,
-    adapter_net.apply, X_train_jax, global_ols_coeffs, is_training=False,
-    swnn_input_dist_mean=swnn_input_dist_mean, swnn_input_dist_std=swnn_input_dist_std
+print("\n--- Generating Target Parameters (μ, σ) from Trained Teacher ---")
+mu_teacher_train, sigma_teacher_train, _ = gnnwr_predict(
+    best_teacher_state.params, best_teacher_state.batch_stats,
+    query_locs=locs_train_jax, apply_fn=adapter_net.apply, x_batch=X_train_jax,
+    global_ols_coeffs=global_ols_coeffs, is_training=False, reference_locs=locs_train_jax,
+    swnn_input_dist_mean=swnn_input_dist_mean, swnn_input_dist_std=swnn_input_dist_std,
+    k=K_NEIGHBORS
 )
-print(f"Generated {teacher_mu_train.shape[0]} sets of target mu/sigma values and coefficients.")
-
+print(f"Generated teacher's μ and σ for {mu_teacher_train.shape[0]} training points.")
 
 # ==============================================================================
-# SECTION 5: DEFINE AND TRAIN THE STUDENT MODEL (LikelihoodWeightNet)
+# SECTION 5: IMPLEMENT AND TRAIN THE DYNAMIC WEIGHTING MODEL
 # ==============================================================================
-print("\n--- Defining and Training Student Model (LikelihoodWeightNet) ---")
+print("\n--- Defining and Training the Dynamic GWR-style Model ---")
+print("This model learns a dynamic kernel f(distance)->weight.")
+print("The loss for a query 'q' is: sum(w_qi * NLL_i), where 'i' are neighbors of 'q'.")
 
-class LikelihoodWeightNet(nn.Module):
-    """NN that learns to output spatial weights for any given location."""
-    num_training_points: int
-    hidden_dims: tuple = (256, 128, 64)
+class DynamicWeightNet(nn.Module):
+    """Takes a distance and learns a kernel function to output a weight."""
+    hidden_dims: tuple = (32, 16)
     @nn.compact
     def __call__(self, x, train: bool):
+        # Input x is a distance value, shaped (batch, 1)
         for h_dim in self.hidden_dims:
             x = nn.Dense(features=h_dim)(x)
-            x = nn.PReLU()(x)
-        raw_weights = nn.Dense(features=self.num_training_points)(x)
-        return nn.softmax(raw_weights)
+            x = nn.relu(x)
+        weight = nn.Dense(features=1)(x)
+        # Use softplus to ensure weights are positive
+        return nn.softplus(weight)
 
-def negative_weighted_log_likelihood(beta_params, x_data, y_data, weights):
-    """The weighted log-likelihood function to be maximized (or minimized as negative)."""
-    beta_mu, beta_sigma = beta_params[:x_data.shape[1]], beta_params[x_data.shape[1]:]
-    mu_pred = x_data @ beta_mu
-    log_sigma2_pred = x_data @ beta_sigma
-    sigma_pred = jnp.exp(0.5 * log_sigma2_pred)
-    
-    # Clamp sigma_pred to avoid log(0) or division by zero
-    sigma_pred_safe = jnp.maximum(sigma_pred, DIST_EPSILON)
-    
-    log_pdf = -0.5 * jnp.log(2 * jnp.pi * sigma_pred_safe**2) - (y_data - mu_pred)**2 / (2 * sigma_pred_safe**2)
-    return -jnp.sum(weights * log_pdf)
+@partial(jax.jit, static_argnames=['apply_fn'])
+def train_step_dynamic_weighted_sum_nll(state, apply_fn, neighbor_info_batch):
+    """
+    Performs a training step for the dynamic weighting model.
+    The loss for each query point's neighborhood is the weighted sum of the neighbors' NLLs.
+    """
+    # Unpack the pre-gathered neighbor data
+    y_n_batch, mu_teacher_n_batch, sigma_teacher_n_batch, dists_n_batch = neighbor_info_batch
 
-def find_coeffs_by_optimization(weights, x_train_intercept, y_train, initial_beta_guess):
-    """Inner optimization loop to find coefficients for a given set of weights."""
-    optimizer = optax.adam(learning_rate=0.05)
-    opt_state = optimizer.init(initial_beta_guess)
-    loss_fn_inner = partial(negative_weighted_log_likelihood, x_data=x_train_intercept, y_data=y_train, weights=weights)
-    grad_fn_inner = jax.value_and_grad(loss_fn_inner)
-    
-    def optimization_step(carry, _):
-        beta_params, current_opt_state = carry
-        loss, grads = grad_fn_inner(beta_params)
-        updates, new_opt_state = optimizer.update(grads, current_opt_state)
-        new_beta_params = optax.apply_updates(beta_params, updates)
-        return (new_beta_params, new_opt_state), loss
-        
-    (final_beta, _), _ = jax.lax.scan(optimization_step, (initial_beta_guess, opt_state), jnp.arange(50))
-    return final_beta
-
-# Vectorize the optimization function to run on batches
-batched_find_coeffs = jax.vmap(find_coeffs_by_optimization, in_axes=(0, None, None, None))
-
-LAMBDA_ENTROPY = 0.75 # Regularization strength for weight entropy
-
-@partial(jax.jit, static_argnames=('apply_fn',))
-def train_step_student(state, x_batch, locs_batch, teacher_mu_batch, teacher_sigma_batch, apply_fn, 
-                       x_train_intercept_full, y_train_full, all_train_locs, 
-                       swnn_input_dist_mean, swnn_input_dist_std, initial_beta_guess):
-    """A single training step for the student model, targeting mu and sigma."""
-    
-    # 1. Calculate distances for the student network input
-    dists_batch = (calculate_distances(locs_batch, all_train_locs) - swnn_input_dist_mean) / (swnn_input_dist_std + DIST_EPSILON)
-    
     def loss_fn(params):
-        # 2. Get spatial weights from the student network
-        weights_batch = apply_fn({'params': params}, dists_batch, train=True)
-        
-        # 3. For each set of weights, find the optimal coefficients by maximizing the weighted log-likelihood
-        beta_pred = batched_find_coeffs(weights_batch, x_train_intercept_full, y_train_full, initial_beta_guess)
-        
-        # 4. Use the found coefficients (beta_pred) to calculate mu and log_sigma2 for the current batch
-        x_intercept_batch = jnp.concatenate([jnp.ones((x_batch.shape[0], 1)), x_batch], axis=1)
-        mu_pred_batch = jnp.sum(x_intercept_batch * beta_pred[:, :2], axis=1)
-        log_sigma2_pred_batch = jnp.sum(x_intercept_batch * beta_pred[:, 2:], axis=1)
-        
-        # 5. The "true" values are the mu and log(sigma^2) from the teacher model for this batch
-        teacher_log_sigma2_batch = jnp.log(teacher_sigma_batch**2)
-        
-        # 6. Calculate the MSE loss between the student's predictions and the teacher's targets
-        loss_mu = jnp.mean((mu_pred_batch - teacher_mu_batch)**2)
-        loss_log_sigma2 = jnp.mean((log_sigma2_pred_batch - teacher_log_sigma2_batch)**2)
-        mse_loss = loss_mu + loss_log_sigma2
+        # Define the process for a single query's neighborhood, to be vectorized with vmap
+        def single_neighborhood_loss(y_n, mu_teacher_n, sigma_teacher_n, dists_n):
+            # 1. Predict weights for all neighbors based on their distance to the query.
+            #    Input shape: (k, 1) -> Output shape: (k, 1) -> squeeze to (k,)
+            weights = apply_fn({'params': params}, dists_n.reshape(-1, 1), train=True).squeeze()
 
-        # 7. Add an entropy penalty to encourage smoother, less peaky weights
-        entropy_batch = -jnp.sum(weights_batch * jnp.log(weights_batch + DIST_EPSILON), axis=-1)
-        entropy_penalty = -jnp.mean(entropy_batch) # We want to MAXIMIZE entropy, so we MINIMIZE negative entropy
+            # 2. Calculate the NLL for each neighbor using the fixed teacher model's predictions.
+            safe_sigma = sigma_teacher_n + DIST_EPSILON
+            nll_per_neighbor = 0.5 * jnp.log(2 * jnp.pi * safe_sigma**2) + ((y_n - mu_teacher_n)**2 / (2 * safe_sigma**2))
+
+            # 3. The loss for this neighborhood is the weighted sum of the NLLs.
+            weighted_nll = weights * nll_per_neighbor
+            
+            return jnp.sum(weighted_nll)
+
+        # Use vmap to run this process efficiently over the entire batch of neighborhoods
+        batch_losses = jax.vmap(single_neighborhood_loss)(y_n_batch, mu_teacher_n_batch, sigma_teacher_n_batch, dists_n_batch)
         
-        # 8. Combine the losses
-        total_loss = mse_loss + LAMBDA_ENTROPY * entropy_penalty
-        
-        return total_loss
+        # The final loss is the mean of the losses for each neighborhood in the batch
+        return jnp.mean(batch_losses)
 
-    loss, grads = jax.value_and_grad(loss_fn)(state.params)
-    return state.apply_gradients(grads=grads), loss
+    loss_val, grads = jax.value_and_grad(loss_fn)(state.params)
+    return state.apply_gradients(grads=grads), loss_val
 
-# --- Student model training loop ---
-lw_net = LikelihoodWeightNet(num_training_points=locs_train_jax.shape[0])
-key, lw_key_init = jax.random.split(key)
-lw_params = lw_net.init(lw_key_init, jax.random.normal(lw_key_init, (1, locs_train_jax.shape[0])), train=False)['params']
-lw_state = train_state.TrainState.create(apply_fn=lw_net.apply, params=lw_params, tx=optax.adam(learning_rate=1e-4))
+# --- Prepare Data for the Dynamic Model's Training Loop ---
+# For each query point in the training set, we need to gather the data of its K neighbors.
+print("Pre-gathering neighbor data for efficient training...")
+# Use jax.vmap for efficient gathering. It maps a function over the leading axis of an array.
+gather_knn_data = jax.vmap(lambda indices, data: data[indices], in_axes=(0, None))
 
-epochs, batch_size, patience, best_val_loss, patience_counter = 1000, 32, 100, float('inf'), 0
-x_train_intercept_jax = jnp.concatenate([jnp.ones((X_train_jax.shape[0], 1)), X_train_jax], axis=1)
-initial_beta_guess = global_ols_coeffs
+y_neighbors_train = gather_knn_data(precomputed_knn_indices, y_train_jax)
+mu_teacher_neighbors_train = gather_knn_data(precomputed_knn_indices, mu_teacher_train)
+sigma_teacher_neighbors_train = gather_knn_data(precomputed_knn_indices, sigma_teacher_train)
+# The distances are already in the correct (N, K) shape
+dists_neighbors_train = precomputed_knn_dists
+print("Neighbor data prepared.")
 
+# --- Setup for the Dynamic Weighting Model ---
+dynamic_net = DynamicWeightNet()
+key, dyn_key_init = jax.random.split(key)
+dummy_dyn_input = jnp.zeros((1, 1)) # Input is a single distance
+dyn_params = dynamic_net.init(dyn_key_init, dummy_dyn_input, train=False)['params']
+
+dyn_optimizer = optax.chain(
+    optax.clip_by_global_norm(1.0),
+    optax.adam(learning_rate=1e-5) # Use a smaller learning rate for this more complex model
+)
+dyn_state = train_state.TrainState.create(
+    apply_fn=dynamic_net.apply,
+    params=dyn_params,
+    tx=dyn_optimizer
+)
+
+# --- Training Loop for the Dynamic Model ---
+epochs, batch_size, patience, best_val_loss, patience_counter = 10000, 128, 500, float('inf'), 0
+print(f"\nTraining dynamic model for {epochs} epochs...")
+
+num_train_points = X_train_jax.shape[0]
 for epoch in range(epochs):
     key, shuffle_key = jax.random.split(key)
-    perm = jax.random.permutation(shuffle_key, locs_train_jax.shape[0])
+    perm = jax.random.permutation(shuffle_key, num_train_points)
     
-    # Shuffle all corresponding training arrays using the same permutation
-    shuffled_locs = locs_train_jax[perm]
-    shuffled_X = X_train_jax[perm]
-    shuffled_teacher_mu = teacher_mu_train[perm]
-    shuffled_teacher_sigma = teacher_sigma_train[perm]
-    
+    # Shuffle all corresponding neighbor data arrays together
+    shuffled_y_n = y_neighbors_train[perm]
+    shuffled_mu_n = mu_teacher_neighbors_train[perm]
+    shuffled_sigma_n = sigma_teacher_neighbors_train[perm]
+    shuffled_dists_n = dists_neighbors_train[perm]
+
     epoch_train_loss = 0
-    num_batches = int(np.ceil(locs_train_jax.shape[0] / batch_size))
-    
+    num_batches = int(np.ceil(num_train_points / batch_size))
     for i in range(num_batches):
-        start_idx = i * batch_size
-        end_idx = (i + 1) * batch_size
+        start_idx, end_idx = i * batch_size, (i + 1) * batch_size
         
-        # Create batches from the shuffled arrays
-        locs_b = shuffled_locs[start_idx:end_idx]
-        x_b = shuffled_X[start_idx:end_idx]
-        teacher_mu_b = shuffled_teacher_mu[start_idx:end_idx]
-        teacher_sigma_b = shuffled_teacher_sigma[start_idx:end_idx]
-        
-        # Call the new training step
-        lw_state, loss_item = train_step_student(
-            lw_state, x_b, locs_b, teacher_mu_b, teacher_sigma_b, 
-            lw_net.apply, x_train_intercept_jax, y_train_jax, locs_train_jax, 
-            swnn_input_dist_mean, swnn_input_dist_std, initial_beta_guess
+        # Create the batch of neighbor information
+        neighbor_info_b = (
+            shuffled_y_n[start_idx:end_idx],
+            shuffled_mu_n[start_idx:end_idx],
+            shuffled_sigma_n[start_idx:end_idx],
+            shuffled_dists_n[start_idx:end_idx]
+        )
+
+        if neighbor_info_b[0].shape[0] == 0: continue
+
+        dyn_state, loss_item = train_step_dynamic_weighted_sum_nll(
+            dyn_state,
+            dynamic_net.apply,
+            neighbor_info_b
         )
         epoch_train_loss += loss_item
-        
+
+        if jnp.isnan(loss_item) or jnp.isinf(loss_item):
+            print(f"\n!!! Training stopped at epoch {epoch+1}, batch {i+1} due to NaN/inf loss. !!!")
+            break
+    if jnp.isnan(loss_item) or jnp.isinf(loss_item): break
+
     avg_train_loss = epoch_train_loss / num_batches
-    if (epoch + 1) % 10 == 0:
-      print(f"Student | Epoch {epoch+1:03d} | MSE+Entropy Loss: {avg_train_loss:.8f}")
-      
+    if (epoch + 1) % 100 == 0:
+        print(f"Dynamic Model | Epoch {epoch+1:05d} | Weighted NLL Sum: {avg_train_loss:.8f}")
+
     if avg_train_loss < best_val_loss:
-        best_val_loss, best_lw_state, patience_counter = avg_train_loss, lw_state, 0
+        best_val_loss, best_dyn_state, patience_counter = avg_train_loss, dyn_state, 0
     else:
         patience_counter += 1
     if patience_counter >= patience:
-        print(f"Student training stopped early at epoch {epoch+1}.")
+        print(f"Training stopped early at epoch {epoch+1}.")
         break
 
 # ==============================================================================
-# SECTION 6: DIAGNOSTIC PLOTS FOR THE STUDENT MODEL
+# SECTION 6: VISUALIZE THE DYNAMICALLY LEARNED WEIGHTING KERNEL
 # ==============================================================================
-print("\n--- Generating Diagnostic Plots for Student Model ---")
-# Calculate the final weights and resulting coefficients from the trained student model
-dists_all = (calculate_distances(locs_train_jax, locs_train_jax) - swnn_input_dist_mean) / (swnn_input_dist_std + DIST_EPSILON)
-final_weights = best_lw_state.apply_fn({'params': best_lw_state.params}, dists_all, train=False)
-student_coeffs_train = batched_find_coeffs(final_weights, x_train_intercept_jax, y_train_jax, initial_beta_guess)
+print("\n--- Generating Animation of the Learned Dynamic Kernel ---")
 
-# --- Calculate student's mu and log_sigma2 predictions from its found coefficients ---
-student_mu_train = jnp.sum(x_train_intercept_jax * student_coeffs_train[:, :2], axis=1)
-student_log_sigma2_train = jnp.sum(x_train_intercept_jax * student_coeffs_train[:, 2:], axis=1)
-teacher_log_sigma2_train = jnp.log(teacher_sigma_train**2)
+# --- Setup the plot elements first ---
+fig_anim, ax_anim = plt.subplots(figsize=(12, 7))
 
-# --- Plot 1: Correlation for mu and log(sigma^2) ---
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-fig.suptitle('Student Diagnostic 1: Teacher vs. Student Distribution Parameter Correlation', fontsize=16)
+# We will animate a subset of points for speed
+num_frames = 50 
+# Sort points by their x-feature to get a smooth animation across the data space
+sorted_indices_anim = np.argsort(X_train_jax.flatten())
+sampler_indices = np.linspace(0, len(sorted_indices_anim) - 1, num_frames, dtype=int)
+indices_to_animate = sorted_indices_anim[sampler_indices]
 
-plot_data = [
-    (teacher_mu_train, student_mu_train, 'μ (Mean)'),
-    (teacher_log_sigma2_train, student_log_sigma2_train, 'log(σ²) (Log Variance)')
-]
+# Predict all weights once to get a consistent color scale for the animation
+all_predicted_weights = dynamic_net.apply(
+    {'params': best_dyn_state.params},
+    dists_neighbors_train.reshape(-1, 1), # Flatten distances to predict all weights
+    train=False
+).reshape(dists_neighbors_train.shape) # Reshape back to (N, K)
+vmax = jnp.percentile(all_predicted_weights, 98) # Use 98th percentile for better color contrast
 
-for i, (true_vals, pred_vals, name) in enumerate(plot_data):
-    ax = axes[i]
-    ax.scatter(np.array(true_vals), np.array(pred_vals), alpha=0.5, label='Predictions')
-    lims = [min(ax.get_xlim()[0], ax.get_ylim()[0]), max(ax.get_xlim()[1], ax.get_ylim()[1])]
-    ax.plot(lims, lims, 'r--', alpha=0.75, label='Perfect Match (y=x)')
-    ax.set_xlabel(f'Teacher {name}')
-    ax.set_ylabel(f'Student {name}')
-    ax.set_title(f'Correlation for {name}')
-    ax.grid(True)
-    ax.legend()
+# --- Create the artists ONCE before the animation starts ---
 
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-
-# --- Plot 2: Visualization of the learned spatial weight kernels ---
-plt.figure(figsize=(14, 7))
-plt.style.use('seaborn-v0_8-whitegrid')
-plt.title('Student Diagnostic 2: Learned Spatial Weight Kernels', fontsize=16)
-# Plot kernels for points at the start, middle, and end of the location range
-indices_to_plot = [0, len(locs_train_jax) // 2, len(locs_train_jax) - 1]
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
-# The data is already sorted by location, so we can plot directly
-for i, loc_idx in enumerate(indices_to_plot):
-    weights_for_loc = final_weights[loc_idx, :]
-    loc_val = locs_train_jax[loc_idx]
-    plt.plot(locs_train_jax.flatten(), weights_for_loc, color=colors[i], alpha=0.3)
-    plt.fill_between(locs_train_jax.flatten(), weights_for_loc, color=colors[i], alpha=0.2, label=f'Kernel for loc ≈ {loc_val.item():.2f}')
-    plt.axvline(x=loc_val, color=colors[i], linestyle='--', lw=2)
-plt.xlabel('Training Data Locations'), plt.ylabel('Weight Value'), plt.legend(), plt.grid(True, alpha=0.5), plt.tight_layout()
-plt.show()
-
-# --- Plot 3: Data-Weight Visualization ---
-print("\n--- Generating Diagnostic Plot 3: Data-Weight Visualization ---")
-# Choose a reference point to visualize (e.g., the 30th point in the sorted training data)
-ref_idx = 75
-
-# Get the unscaled x-location for plotting labels
-ref_x_unscaled = X_train[ref_idx, 0]
-ref_y = y_train_jax[ref_idx]
-
-# Get the weights generated by the student model for this specific reference location
-weights_for_ref_loc = final_weights[ref_idx, :]
-
-plt.figure(figsize=(14, 8))
-
-# Plot all training data points, colored and sized by their weight for the reference point
-scatter = plt.scatter(
-    X_train[:, 0], # Use original, unscaled X for plotting
-    y_train_jax, 
-    c=weights_for_ref_loc, 
-    s=weights_for_ref_loc * 200 + 15,  # Scale size for visibility
-    alpha=0.7,
-    cmap='viridis',
-    label='Training Data Points (colored by weight)'
+# 1. Main scatter plot of all data points. We'll update its colors later.
+#    Initialize with zero weights for the color.
+scat = ax_anim.scatter(
+    X_train_jax[:, 0], y_train_jax, c=jnp.zeros(num_train_points), s=35,
+    alpha=0.8, cmap='viridis', vmin=0, vmax=vmax
 )
 
-# Highlight the reference point itself in red
-plt.scatter(
-    ref_x_unscaled, 
-    ref_y, 
-    c='red', 
-    s=250,
-    edgecolor='black',
-    linewidth=1.5,
-    zorder=5, 
-    label=f'Reference Point (Index {ref_idx})'
-)
+# 2. Colorbar, created once and attached to the scatter plot artist.
+fig_anim.colorbar(scat, ax=ax_anim, label='Dynamic Weight (w_qi)')
 
-# Add a vertical line at the reference location
-plt.axvline(x=ref_x_unscaled, color='red', linestyle='--', lw=1.5, alpha=0.7)
+# 3. Query point highlight (a red star), initialized off-screen.
+query_highlight = ax_anim.scatter([], [], c='red', s=400, marker='*', 
+                                  edgecolor='black', linewidth=1.5, zorder=5, label='Query Point')
 
-# Formatting
-cbar = plt.colorbar(scatter)
-cbar.set_label('Weight Value', rotation=270, labelpad=20)
-plt.title(f'Student Diagnostic 3: Weight Influence for Reference Point at x ≈ {ref_x_unscaled:.2f}', fontsize=16)
-plt.xlabel('Feature X (Location)')
-plt.ylabel('Target y')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.show()
+# 4. Vertical line for the query point.
+vline = ax_anim.axvline(x=X_train_jax[0, 0], color='red', linestyle='--', lw=1.5, alpha=0.8)
+
+# 5. Set static labels and title
+ax_anim.set_xlabel('Feature X (Scaled)')
+ax_anim.set_ylabel('Target y')
+ax_anim.legend()
+ax_anim.grid(True, alpha=0.4)
+title = ax_anim.set_title('Learned Dynamic Kernel', fontsize=16)
+
+
+# --- Define the animation update function ---
+def update_animation(frame_index):
+    # This is the current query point for this frame of the animation
+    query_idx = indices_to_animate[frame_index]
+    
+    # Get the specific weights generated for the neighbors of THIS query point
+    dynamic_weights_for_query = all_predicted_weights[query_idx]
+    neighbor_indices = precomputed_knn_indices[query_idx]
+    
+    # Create a full weight vector for plotting. Most points will have a weight of 0.
+    weights_for_plotting = jnp.zeros(num_train_points)
+    weights_for_plotting = weights_for_plotting.at[neighbor_indices].set(dynamic_weights_for_query)
+    
+    # --- Update the data of the existing artists ---
+    
+    # Update the color array of the main scatter plot
+    scat.set_array(weights_for_plotting)
+    # Update the size of the points based on weight
+    scat.set_sizes(weights_for_plotting * 200 + 15)
+
+    # Move the query highlight to the new position
+    query_x, query_y = X_train_jax[query_idx, 0], y_train_jax[query_idx]
+    query_highlight.set_offsets([query_x, query_y])
+    
+    # Move the vertical line
+    vline.set_xdata([query_x])
+    
+    # Update the title
+    title.set_text(f'Learned Dynamic Kernel (Query Point {frame_index+1}/{num_frames})')
+    
+    print(f"Processing animation frame {frame_index+1}/{num_frames}...")
+    
+    # Return the tuple of artists that were changed
+    return scat, query_highlight, vline, title
+
+# --- Create and save the animation ---
+anim = FuncAnimation(fig_anim, update_animation, frames=len(indices_to_animate), 
+                     interval=200, blit=False) # Set blit=False for simplicity with text updates
+output_filename = r"c:\github\EVT_Univariate\EVT_Classes\NN\student_weight_animation_knn.gif"
+anim.save(output_filename, writer='pillow', fps=5)
+plt.close(fig_anim)
+
+print(f"\n✅ Animation complete! Saved as '{output_filename}'")
