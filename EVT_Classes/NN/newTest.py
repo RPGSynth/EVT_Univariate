@@ -80,7 +80,7 @@ def get_simulated_data(n_samples=5000, key_data=jax.random.PRNGKey(123), **kwarg
     return (np.array(locs), np.array(X_features), np.array(y))
 
 # --- Data Preparation ---
-locs, X, y = get_simulated_data(n_samples=700, noise_y_std=0.5, x_slope_coeff=0.9)
+locs, X, y = get_simulated_data(n_samples=750, noise_y_std=0.5, x_slope_coeff=0.9)
 locs_train_val, locs_test, X_train_val, X_test, y_train_val, y_test = train_test_split(locs, X, y, test_size=0.20, random_state=42)
 locs_train, locs_val, X_train, X_val, y_train, y_val = train_test_split(locs_train_val, X_train_val, y_train_val, test_size=0.25, random_state=42)
 
@@ -304,7 +304,7 @@ def train_step_dynamic_weighted_sum_nll(state, apply_fn, neighbor_info_batch):
             # 3. The loss for this neighborhood is the weighted sum of the NLLs.
             weighted_nll = weights * nll_per_neighbor
             
-            return jnp.sum(weighted_nll)
+            return jnp.sum(weighted_nll) / jnp.sum(weights)
 
         # Use vmap to run this process efficiently over the entire batch of neighborhoods
         batch_losses = jax.vmap(single_neighborhood_loss)(y_n_batch, mu_teacher_n_batch, sigma_teacher_n_batch, dists_n_batch)
@@ -345,7 +345,7 @@ dyn_state = train_state.TrainState.create(
 )
 
 # --- Training Loop for the Dynamic Model ---
-epochs, batch_size, patience, best_val_loss, patience_counter = 10000, 128, 500, float('inf'), 0
+epochs, batch_size, patience, best_val_loss, patience_counter = 1000, 500, 500, float('inf'), 0
 print(f"\nTraining dynamic model for {epochs} epochs...")
 
 num_train_points = X_train_jax.shape[0]
