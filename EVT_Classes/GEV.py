@@ -1,5 +1,6 @@
 # Standard library imports
 import os
+os.environ["JAX_PLATFORMS"] = "cpu"
 import warnings
 from typing import Dict, Union, Optional, Callable, Any, List, Tuple, TypeVar
 from abc import ABC, abstractmethod
@@ -12,26 +13,32 @@ import numpy as np
 import pandas as pd
 import xarray as xrs
 import numdifftools as nd
-# import statsmodels.api as sms # Not used directly in GEV part?
-# import matplotlib.pyplot as plt # Used only in deprecated plot part
-# from matplotlib import rcParams # Used only in deprecated plot part
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from scipy.optimize import minimize, approx_fprime, OptimizeResult
 from scipy.stats import norm, chi2, gumbel_r, genextreme
-# from statsmodels.base.model import GenericLikelihoodModel # Not used directly
 from concurrent.futures import ProcessPoolExecutor
 from joblib import Parallel, delayed
+from enum import Enum, auto
 
 
+#Testing Jax
+import jax
+import jax.numpy as jnp
+from jax import grad, hessian, jit, vmap
+import jaxopt
 logging.basicConfig(level=logging.INFO)  # Set logging level to show info messages
+
+class FitMethod(Enum):
+    MLE = auto()
+    PROFILE = auto()
 
 # Type Aliases for clarity
 ArrayLike = Union[np.ndarray, pd.Series, pd.DataFrame, List[float], List[List[float]], xrs.DataArray]
 LinkFunc = Callable[[np.ndarray], np.ndarray]
 ExogInput = Optional[Union[Dict[str, Optional[ArrayLike]], ArrayLike]]
 
-class GEV(ABC):
+class _GEVBase(ABC):
     """
     Abstract base class for GEV statistical models.
 
@@ -183,7 +190,7 @@ class GEV(ABC):
                 shape_zero_mask = np.isclose(shape, 0)
                 location = np.where(
                     shape_zero_mask,
-                    zp - scale * np.log(y_p), # Corrected Gumbel inversion: zp = mu - scale*log(yp) -> mu = zp + scale*log(yp) **ERROR in original code** -> mu = zp + scale * (-np.log(y_p))? No, Gumbel quantile is mu - scale*log(-log(p)). p = 1-1/T. yp = -log(1-1/T) = -log(p_exceedance). So quantile = mu - scale * log(yp). Hence mu = zp + scale*log(yp). Original was correct.
+                    zp + scale * np.log(y_p), # Corrected Gumbel inversion: zp = mu - scale*log(yp) -> mu = zp + scale*log(yp) **ERROR in original code** -> mu = zp + scale * (-np.log(y_p))? No, Gumbel quantile is mu - scale*log(-log(p)). p = 1-1/T. yp = -log(1-1/T) = -log(p_exceedance). So quantile = mu - scale * log(yp). Hence mu = zp + scale*log(yp). Original was correct.
                     zp + scale * (1 - y_p**(-shape)) / shape # GEV inversion: zp = mu + scale/shape * ((-log(1-1/T))**(-shape) - 1) -> mu = zp - scale/shape * (yp**(-shape) - 1) **ERROR in original code** -> mu = zp + scale/shape * (1 - yp**(-shape)). Original was correct.
                  )
 
@@ -205,7 +212,7 @@ class GEV(ABC):
 
         # Check for invalid values: 1 + xi * (y - mu) / sigma > 0 for xi != 0
         # This check should technically be done *before* log/power operations
-        invalid_gev_domain =  (weights > 0) & np.any(scale <= 0) & (~is_gumbel) & (transformed_data <= 1e-9) # Use epsilon
+        invalid_gev_domain =  (weights > 0) & (scale <= 0) & (~is_gumbel) & (transformed_data <= 1e-9) # Use epsilon
         if np.any(invalid_gev_domain):
              return 1e7
 
@@ -242,13 +249,97 @@ class GEV(ABC):
              return 1e8 # Return even larger penalty if sum somehow becomes non-finite
 
         return avg_nll
+    
+
+    @staticmethod
+    @partial(jit, static_argnames=('loc_link', 'scale_link', 'shape_link', 'loc_return_level_reparam','len_exog'))
+    def nloglike_jax(params: jnp.ndarray,
+                     endog: jnp.ndarray,
+                     exog_loc: jnp.ndarray,
+                     exog_scale: jnp.ndarray,
+                     exog_shape: jnp.ndarray,
+                     weights: jnp.ndarray,
+                     len_exog: Tuple[int, int, int],
+                     loc_link: Callable,
+                     scale_link: Callable,
+                     shape_link: Callable,
+                     loc_return_level_reparam: bool,
+                     T: Optional[float] = None) :
+        """
+        Computes the negative log-likelihood using JAX.
+        This is a static method to be a pure function.
+        """
+        total_weight = jnp.sum(weights)
+
+        i, j, k = len_exog
+        loc_params = params[0:i]
+        scale_params = params[i:i+j]
+        shape_params = params[i+j:i+j+k]
+
+        scale = scale_link(jnp.einsum('njp,j->np', exog_scale, scale_params))
+        
+        # JAX requires explicit handling of potential invalid values.
+        # We can return a large value if scale is non-positive.
+        is_scale_invalid = jnp.any(scale <= 1e-9)
+
+        shape = shape_link(jnp.einsum('nkp,k->np', exog_shape, shape_params))
+
+        if loc_return_level_reparam:
+            if T is None:
+                # This check should ideally happen before JIT compilation.
+                # For simplicity, we assume T is valid if reparam is on.
+                raise ValueError("T must be set for return level reparameterization.")
+            zp = loc_link(jnp.einsum('nip,i->np', exog_loc, loc_params))
+            y_p = -jnp.log(1 - 1 / T)
+            
+            shape_zero_mask = jnp.isclose(shape, 0)
+            # JAX equivalent of the original logic
+            location = jnp.where(
+                shape_zero_mask,
+                zp + scale * jnp.log(y_p),
+                zp + scale / shape * (1 - y_p**(-shape))
+            )
+        else:
+            location = loc_link(jnp.einsum('nip,i->np', exog_loc, loc_params))
+
+        is_params_invalid = jnp.any(~jnp.isfinite(location))
+
+        normalized_data = (endog - location) / scale
+        transformed_data = 1 + shape * normalized_data
+        is_gumbel = jnp.isclose(shape, 0)
+
+        # Check for invalid GEV domain: 1 + xi * (y - mu) / sigma <= 0
+        is_domain_invalid = jnp.any((~is_gumbel) & (transformed_data <= 1e-9) & (weights > 0))
+
+        # Gumbel cases
+        log_scale = jnp.log(scale)
+        gumbel_term = log_scale + normalized_data + jnp.exp(-normalized_data)
+        
+        # General GEV case
+        log_transformed = jnp.log(transformed_data)
+        gev_term = log_scale + transformed_data**(-1 / shape) + (1 + 1 / shape) * log_transformed
+
+        n_ll_terms = jnp.where(is_gumbel, gumbel_term, gev_term)
+
+        # Final check for NaN/Inf in the terms themselves
+        is_computation_invalid = jnp.any(~jnp.isfinite(n_ll_terms))
+        
+        # Calculate likelihood, but return a large penalty if any invalid condition was met
+        avg_nll = jnp.sum(n_ll_terms * weights) / total_weight
+
+        # Combine all invalid conditions.
+        # Note: In a JIT context, all branches are typically evaluated.
+        is_invalid = is_scale_invalid | is_params_invalid | is_domain_invalid | is_computation_invalid
+        
+        return jnp.where(is_invalid, 1e8, avg_nll)
+
 
     def loglike(self, params: np.ndarray) -> float:
         """Computes the log-likelihood (negative of nloglike)."""
         return -self.nloglike(params)
 
     @abstractmethod
-    def fit(self, start_params: Optional[np.ndarray] = None, optim_method: str = 'L-BFGS-B', fit_method: str = 'MLE') -> 'GEVFit':
+    def fit(self, start_params: Optional[np.ndarray] = None, optim_method: str = 'L-BFGS-B', fit_method: FitMethod = FitMethod.MLE) -> 'GEVFit':
         """
         Fit the model to data. Abstract method to be implemented by subclasses.
 
@@ -264,7 +355,7 @@ class GEV(ABC):
         """
         raise NotImplementedError("Subclasses must implement the fit method.")
 
-class GEVSample(GEV):
+class GEV(_GEVBase):
     """
     GEV model implementation for fitting a data sample.
 
@@ -372,6 +463,17 @@ class GEVSample(GEV):
         #---------- Fit Attributes Init ----------
         self.result: Optional[OptimizeResult] = None # Store optimization result
         self.fitted: bool = False # Flag
+        
+        self.endog_j = jax.device_put(jnp.asarray(self.endog))
+        self.exog_j = {
+            'location': jax.device_put(jnp.asarray(self.exog['location'])),
+            'scale': jax.device_put(jnp.asarray(self.exog['scale'])),
+            'shape': jax.device_put(jnp.asarray(self.exog['shape'])),
+        }
+        # Also handle weights, ensuring it exists before conversion.
+        # Your original __init__ sets self.weights.
+        numpy_weights = self.weights if self.weights is not None else np.ones_like(self.endog)
+        self.weights_j = jax.device_put(jnp.asarray(numpy_weights))
 
     def _process_exog(self, exog_input: ExogInput) -> None:
         """
@@ -456,7 +558,6 @@ class GEVSample(GEV):
         )
         self.nparams: int = sum(self.len_exog)
 
-
     def _validate_and_reshape_exog_array(self, exog_array: np.ndarray, param_name: str) -> np.ndarray:
         """
         Validates covariate array shape and reshapes to (n_obs, n_covariates + 1, n_samples).
@@ -519,6 +620,32 @@ class GEVSample(GEV):
              raise ValueError(f"exog['{param_name}'] contains NaN values after processing.")
 
         return final_exog
+    
+
+
+    def _get_objective_func(self):
+        """
+        Helper to create a partial function.
+        This is where we perform checks that CANNOT be in the JIT'd code.
+        """
+        
+        if self.loc_return_level_reparam and self.T is None:
+            raise ValueError("Return period T must be provided for reparameterization.")
+        # --- End of fix ---
+        
+        return partial(self.nloglike_jax,
+                        # ... (all the other arguments as before) ...
+                        endog=self.endog_j,
+                        exog_loc=self.exog_j['location'],
+                        exog_scale=self.exog_j['scale'],
+                        exog_shape=self.exog_j['shape'],
+                        weights=self.weights_j,
+                        len_exog=self.len_exog,
+                        loc_link=self.loc_link,
+                        scale_link=self.scale_link,
+                        shape_link=self.shape_link,
+                        loc_return_level_reparam=self.loc_return_level_reparam,
+                        T=self.T)
 
     def hess(self, params: np.ndarray):
         """
@@ -673,16 +800,134 @@ class GEVSample(GEV):
         RL_args : dict[str, bool | int] = {"reparam": self.loc_return_level_reparam}
 
         if RL_args["reparam"]:  # Only include T if reparam is True
-            RL_args["T"] = 1
+            RL_args["T"] = self.T
 
         match fit_method.lower():
             case "mle":
-                return self._fit_mle(start_params, optim_method, RL_args)
+                return self._fit_mle(start_params=start_params, optim_method=optim_method,RL_args=RL_args)
             case "profile":
                 print("oh")
                 return self._fit_profile(start_params, optim_method, RL_args)
             case _:
                 raise ValueError("Unsupported fit method. Choose 'MLE' or 'Profile'.")
+            
+    def _fit_mle_jax(self, start_params: Optional[jnp.ndarray] = None, maxiter: int = 500):
+        """
+        Fits the model using JAX. It optimizes the parameters, then computes
+        the Hessian and the robust covariance matrix.
+        """
+        # Use the same initial guess logic, but ensure it's a JAX array
+        if start_params is None:
+            i, j, k = self.len_exog
+            vec = ([self.location_guess] + [0.] * (i - 1) +
+                [self.scale_guess] + [0.] * (j - 1) +
+                [self.shape_guess] + [0.] * (k - 1))
+            start_params = jnp.array(vec, dtype=jnp.float32)
+
+        # --- 1. Get the JIT-able objective function ---
+        #print("Preparing JAX objective function...")
+        obj_fun = self._get_objective_func()
+
+        # --- 2. Run the JAX-native optimizer ---
+        #print("Running optimization with jaxopt.LBFGS...")
+        solver = jaxopt.LBFGS(fun=obj_fun, maxiter=maxiter, tol=1e-5)
+        mle_params, state = solver.run(start_params)
+        n_ll = state.value
+
+        if state.error > 1e-3: # Check if solver converged
+            warnings.warn(f"Optimization may not have converged. Final error: {state.error}", RuntimeWarning)
+        #print(f"Optimization finished. Final NLL: {n_ll:.4f}")
+
+        # --- 3. Compute the Hessian ("Bread" of the sandwich) ---
+        #print("Calculating Hessian matrix...")
+        H_bar = jax.hessian(obj_fun)(mle_params)
+
+        # --- 4. Compute the Robust Covariance Matrix ---
+        #print("Calculating robust Godambe (sandwich) covariance matrix...")
+        cov_matrix_j = self._compute_godambe_covariance_jax(mle_params, H_bar)
+
+        # --- 5. Package and Return Results ---
+        #print("Fit complete. Packaging results.")
+        # Convert JAX arrays back to NumPy for the GEVFit object and downstream use
+        fitted_loc, fitted_scale, fitted_shape = self._get_gev_params_numpy(np.array(mle_params))
+        
+        # We will need to update GEVFit to handle these results
+        return GEVFit(
+            gevSample=self,
+            fitted_params=np.array(mle_params),
+            gev_params=(fitted_loc, fitted_scale, fitted_shape),
+            n_ll=float(n_ll),
+            cov_matrix=np.array(cov_matrix_j),
+            jacobian=np.array(state.grad), # Gradient at the final step
+            # CIs will be computed from the covariance matrix inside GEVFit or a helper
+            CIs=self._compute_CIs_mle(np.array(cov_matrix_j), np.array(mle_params), 0.95),
+            fit_method='MLE_JAX',
+            RL_args={"reparam": self.loc_return_level_reparam, "T": self.T}
+        )
+
+
+    def _get_gev_params_numpy(self, params: np.ndarray):
+        """Helper to compute fitted GEV parameters from regression coefficients using NumPy."""
+        i, j, k = self.len_exog
+        loc_p, scale_p, shape_p = params[:i], params[i:i+j], params[i+j:]
+        
+        fitted_loc = self.loc_link(np.einsum('nip,i->np', self.exog['location'], loc_p))
+        fitted_scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], scale_p))
+        fitted_shape = self.shape_link(np.einsum('nkp,k->np', self.exog['shape'], shape_p))
+        
+        return fitted_loc, fitted_scale, fitted_shape
+    
+
+    # Add this method to your GEV_JAX_Final class
+
+    def _compute_godambe_covariance_jax(self, mle_params: jnp.ndarray, H_bar: jnp.ndarray) -> jnp.ndarray:
+        """
+        Computes the Godambe information matrix (sandwich covariance) using JAX.
+        A = H_bar (Hessian of average NLL)
+        B = (1/W^2) * sum(g_i @ g_i.T) where g_i is the sum of weighted gradients for row i.
+        """
+        w_mat = self.weights_j
+        W = jnp.sum(w_mat)
+        
+        # 1. Define a function that computes NLL for a SINGLE observation row
+        def row_nll(w_row, endog_row, ex_loc_row, ex_sca_row, ex_sha_row, params):
+            # We need to add a batch dimension for the pure function to work
+            w_row, endog_row = w_row[jnp.newaxis, :], endog_row[jnp.newaxis, :]
+            ex_loc_row, ex_sca_row, ex_sha_row = (
+                ex_loc_row[jnp.newaxis, ...], 
+                ex_sca_row[jnp.newaxis, ...], 
+                ex_sha_row[jnp.newaxis, ...]
+            )
+            return self.nloglike_jax(
+                params, endog_row, ex_loc_row, ex_sca_row, ex_sha_row, w_row, 
+                self.len_exog, self.loc_link, self.scale_link, self.shape_link, 
+                self.loc_return_level_reparam, self.T
+            )
+
+        # 2. Get the gradient of the per-row NLL function with respect to params.
+        grad_row_nll = jax.grad(row_nll, argnums=5) # argnums=5 is `params`
+
+        # 3. Use vmap to "vectorize" the gradient calculation across all rows at once.
+        # This is the magic that replaces the slow Python for-loop.
+        all_grad_i = jax.vmap(grad_row_nll, in_axes=(0, 0, 0, 0, 0, None))(
+            w_mat, self.endog_j, self.exog_j['location'], self.exog_j['scale'], 
+            self.exog_j['shape'], mle_params
+        )
+
+        # 4. Compute the "Meat" of the sandwich (B)
+        W_i = jnp.sum(w_mat, axis=1) # Weight sum for each row
+        g_i = W_i[:, None] * all_grad_i # Recover full gradient sum for each row
+        
+        # B = (1/W^2) * sum(outer(g_i, g_i))
+        B = (1.0 / W**2) * jnp.einsum('ip,iq->pq', g_i, g_i)
+
+        # 5. Assemble the sandwich: A_inv @ B @ A_inv
+        A = H_bar
+        A_inv = jnp.linalg.pinv(A)
+            
+        cov_matrix = A_inv @ B @ A_inv
+        return cov_matrix
+
 
     def _fit_mle(self, start_params, optim_method,RL_args):
         """Performs Maximum Likelihood Estimation (MLE)."""
@@ -708,19 +953,55 @@ class GEVSample(GEV):
         hessian_func = nd.Hessian(self.nloglike) 
         H_bar        = hessian_func(mle_params)  
 
-        if getattr(self, "weights", None) is None:
-            total_weight = self.endog.size          # all weights = 1
-        else:
-            total_weight = float(np.sum(self.weights))
+        # ----- Build Godambe (sandwich) covariance -----------------------
+        # We will:
+        #   A = H_bar  (bread: Hessian of the *average* objective)
+        #   B = (1/W^2) Σ_i g_i g_iᵀ,  where g_i = Σ_s w_{i,s} ∇ℓ_{i,s}(θ̂)
+        # To avoid rewriting your log-pdf, we get per-observation gradients by
+        # calling `self.nloglike` with a one-hot weight mask selecting row i.
 
-        # 3-b)  Invert with small ridge in case of near-singularity
+        # 0) weights matrix with shape (n_obs, n_samples)
+        if getattr(self, "weights", None) is None:
+            w_mat = np.ones_like(self.endog, dtype=float)
+        else:
+            w_mat = np.asarray(self.weights, dtype=float)
+
+        W = float(w_mat.sum())          # total weight mass over all cells
+        p = mle_params.size
+        A = H_bar                        # bread (already average-scale)
+        B = np.zeros((p, p), dtype=float)
+
+        # helper: returns a function θ ↦ average NLL of row `idx`
+        def make_row_fun(idx: int):
+            # one-hot mask that keeps original per-sample weights on row idx
+            row_w = np.zeros_like(w_mat)
+            row_w[idx, :] = w_mat[idx, :]
+            def _f(theta):
+                return self.nloglike(theta, weights=row_w)
+            return _f
+
+        # loop over observation rows
+        for idx in range(self.n_obs):
+            f_i    = make_row_fun(idx)           # scalar function of params
+            grad_i = nd.Gradient(f_i)(mle_params)  # ∇ ( average NLL of row i )
+            W_i    = float(w_mat[idx, :].sum())    # weight mass in that row
+
+            # Recover g_i = Σ_s w_{i,s} ∇ℓ_{i,s}: grad_i is (1/W_i) * g_i for the average,
+            # so multiply back by W_i
+            g_i = W_i * grad_i                     # shape (p,)
+            B  += (1.0 / W**2) * np.outer(g_i, g_i)
+
+        # Invert A with a tiny ridge if needed
         try:
-            cov_matrix = np.linalg.inv(H_bar)/ total_weight
+            A_inv = np.linalg.inv(A)
         except np.linalg.LinAlgError:
-            print("WOOOOOO")
-            # add 1e-6 * I ridge to the Hessian and retry
-            #ridge      = 1e-6 * np.eye(H_bar.shape[0])
-            #cov_matrix = np.linalg.inv(H_bar + ridge)
+            ridge = 1e-6 * np.eye(p)
+            A_inv = np.linalg.inv(A + ridge)
+
+        cov_matrix = A_inv @ B @ A_inv            # <-- robust Godambe covariance
+
+        # (Optional) quick diagnostic: effective sample size
+        n_eff = W**2 / float((w_mat**2).sum())
 
         fitted_loc = self.loc_link(np.einsum('nip,i->np', self.exog['location'], self.result.x[:i]))
         fitted_scale = self.scale_link(np.einsum('njp,j->np', self.exog['scale'], self.result.x[i:i+j]))
@@ -858,36 +1139,42 @@ class GEVFit():
     def deviance(self):
         return 0
     
-    def return_level(self, T=None, t=None, s=None, confidence=0.95):
+    def return_level(self, confidence=0.95):
         """
-        Returns an object that can be used to compute return levels lazily.
-
-        Parameters:
-        - gevFit: The fitted GEV model.
-        - T: A list/array of return periods specified by the user.
-        - t: A list/array of time steps specified by the user.
-        - confidence: Confidence level for return level estimation.
-
-        Returns:
-        - A `GEVReturnLevel` object that can compute return levels on demand.
+        Internal factory to create the correct return level calculator.
         """
         if self.RL_args["reparam"]:
-            if T is not None:
-                logging.info(f"Since the return period (T) was specified during model initialization as T = {self.RL_args.get('T')}, it can not be modified. | Your specification will be ignored.")
-            return GEVReturnLevel_reparam(
-                gevFit=self,
-                t=t,
-                s=s,
-                confidence=confidence
-            )
+            return GEVReturnLevelReparam(gevFit=self, confidence=confidence)
         else:
-            return GEVReturnLevel(
-                gevFit=self,
-                T=T,
-                t=t,
-                s=s,
-                confidence=confidence
-            )
+            return GEVReturnLevel(gevFit=self, confidence=confidence)
+            
+    def get_return_levels(self, T, t=None, s=None, confidence=0.95):
+        """
+        Calculates and returns the return level data.
+
+        This is a high-level wrapper that provides direct access to the numbers.
+        """
+        # 1. The factory method is now used internally.
+        rl_calculator = self.return_level(confidence=confidence)
+
+        # 2. It calls the calculator's method to get the data.
+        z_p, ci_lower, ci_upper = rl_calculator.compute(T=T, t=t, s=s)
+
+        return z_p, ci_lower, ci_upper
+    
+
+    def plot_return_levels(self, T, t=None, s=None, show_ci=True, **kwargs):
+        """
+        Generates and displays a return level plot.
+
+        This is the simplest way to get a standard return level plot.
+        """
+        # 1. Use the internal factory to get the right calculator.
+        rl_calculator = self.return_level()
+
+        # 2. Call the plotting method from that calculator object.
+        rl_calculator.time_plot(T=T, t=t, s=s, show_ci=show_ci, **kwargs)
+        
     
     def __str__(self): 
         # Calculate fitted values, SE, z-scores, p-values, AIC, and BIC
@@ -1025,7 +1312,7 @@ class GEVReturnLevelBase(ABC):
         raise NotImplementedError("Subclasses must implement return_level_at method")
     
     @abstractmethod
-    def summary(self):
+    def compute(self, T, t=None, s=None):
         """
         Abstract method to compute return levels and confidence intervals
         over multiple parameter combinations.
@@ -1039,17 +1326,10 @@ class GEVReturnLevelBase(ABC):
 
 
 class GEVReturnLevel(GEVReturnLevelBase):
-    def __init__(self, gevFit, T, t, s, confidence=0.95):
+    def __init__(self, gevFit, confidence=0.95):
         super().__init__(gevFit, confidence)
-        # Default for T: [5, 25, 100, 1000] if not specified
-        self.T = T if T is not None else [5, 25, 100, 1000]
-        
-        # Default for t: range from 0 to number of time steps (axis 0 of exog)
-        self.t = t if t is not None else [self.gevFit.gevSample.endog.shape[0]-1]
-        # Default for s: range from 0 to number of spatial points (axis 2 of exog)
-        self.s = s if s is not None else list(range(self.gevFit.gevSample.endog.shape[1]))
 
-    def return_level_at(self, T, t, s, confidence=0.95):
+    def return_level_at(self,T, t, s):
         """
         Computes the return level of the Generalized Extreme Value (GEV) distribution for a given return period T.
         The confidence interval is estimated using the delta method.
@@ -1134,7 +1414,7 @@ class GEVReturnLevel(GEVReturnLevelBase):
         std_error = np.sqrt(variance)
 
         # Compute confidence interval
-        alpha = 1 - confidence
+        alpha = 1 - self.confidence
         z_crit = norm.ppf(1 - alpha / 2)
         ci_lower = z_p - z_crit * std_error
         ci_upper = z_p + z_crit * std_error
@@ -1142,7 +1422,7 @@ class GEVReturnLevel(GEVReturnLevelBase):
         return z_p, (ci_lower, ci_upper)
   
         
-    def summary(self):
+    def compute(self, T, t=None, s=None):
         """
         Computes return levels and confidence intervals over multiple return periods and time steps.
         
@@ -1152,15 +1432,12 @@ class GEVReturnLevel(GEVReturnLevelBase):
         Raises:
             ValueError: If T, t, or confidence is None.
         """
-        if self.T is None or self.t is None or self.confidence is None:
-            raise ValueError(
-                "Return periods (T), time steps (t), or confidence level are not set. "
-                "Please call set_parameters(T, t, confidence) before using summary."
-            )
-
-        T = np.asarray(self.T)
-        t = np.asarray(self.t, dtype=np.int32)
-        s = np.asarray(self.s, dtype=np.int32)
+        
+        # Set default values for t and s if they are not provided
+        if t is None:
+            t = [self.gevFit.gevSample.endog.shape[0]-1]
+        if s is None:
+            s = list(range(self.gevFit.gevSample.endog.shape[1]))
 
         len_T = len(T)
         len_t = len(t)
@@ -1168,7 +1445,7 @@ class GEVReturnLevel(GEVReturnLevelBase):
 
         # Step 1: Define a helper function for parallel computation
         def compute_rl(T_val, t_val, s_val):
-            z_p, ci = self.return_level_at(T=T_val, t=t_val, s=s_val, confidence=self.confidence)
+            z_p, ci = self.return_level_at(T=T_val, t=t_val, s=s_val)
             return z_p, ci[0], ci[1]
 
         # Step 2: Compute return levels and CIs in parallel
@@ -1211,7 +1488,9 @@ class GEVReturnLevel(GEVReturnLevelBase):
 
     def time_plot(
         self,
-        s=None,
+        T, 
+        t=None, 
+        s=None, 
         show_ci=True,
         save_path=None,
         dpi=300,
@@ -1233,6 +1512,28 @@ class GEVReturnLevel(GEVReturnLevelBase):
 
             If *None* (default), no reference curves are added.
         """
+
+        if s is None:
+            s_to_plot = 0  # Default to the very first series
+        elif isinstance(s, list):
+            if len(s) > 1:
+             warnings.warn(f"Multiple spatial indices provided: {s}. Plotting the first one: {s[0]}")
+            s_to_plot = s[0]
+        else:
+            s_to_plot = s # Assume it's an integer
+
+        
+        if t is None:
+            t = list(range(self.gevFit.gevSample.endog.shape[0]))
+
+        # 2. Calculate data ONLY for the single series we need to plot
+        z_p_array, ci_lower_array, ci_upper_array = self.compute(T=T, t=t, s=[s_to_plot])
+    
+        # 3. Prepare variables for plotting
+        T_vals = np.asarray(T)
+        t_vals = np.asarray(t)
+        s_idx = 0
+        
 
         def _gev_return_level(mu, sigma, xi, T_vals):
             """
@@ -1261,19 +1562,6 @@ class GEVReturnLevel(GEVReturnLevelBase):
             "legend.frameon": False,
         })
 
-        # ------------------ Spatial index handling -------------------------
-        if s is None:
-            s = self.s[0]
-        elif s not in self.s:
-            raise ValueError(f"s = {s} not in self.s")
-
-        # ---------------------- Data preparation ---------------------------
-        T_vals = np.asarray(self.T)            # return-period axis
-        t_vals = np.asarray(self.t)            # time-step axis
-        s_idx  = self.s.index(s)               # spatial index
-
-        z_p_array, ci_lower_array, ci_upper_array = self.summary()
-
         # -------------------------- Plotting -------------------------------
         fig, ax = plt.subplots()
 
@@ -1296,30 +1584,40 @@ class GEVReturnLevel(GEVReturnLevelBase):
             if show_ci:
                 lower = ci_lower_array[:, i, s_idx]
                 upper = ci_upper_array[:, i, s_idx]
-                ax.fill_between(T_vals, lower, upper, color=color, alpha=0.2)
+                ax.fill_between(T_vals, lower, upper, color=color, alpha=0.15)
 
         # ------------- Optional manual reference lines (dotted red) --------
         if manual_params is not None:
             params = np.asarray(manual_params, dtype=float)
-            # Accept (3, n) or (n, 3)
-            if params.shape[0] == 3 and params.ndim == 2:
-                params = params.T
-            elif params.shape[1] != 3:
-                raise ValueError(
-                    "`manual_params` must have shape (3, n) or (n, 3); "
-                    f"got {params.shape}"
-                )
+            params = np.atleast_2d(params)
 
-            for j, (mu, sigma, xi) in enumerate(params):
+            # If already (n, 3), keep it. If (3, n), flip it.
+            if params.shape[1] == 3:
+                pass  # (n, 3) — good
+            elif params.shape[0] == 3:
+                params = params.T  # (3, n) -> (n, 3)
+            else:
+                raise ValueError(
+                "`manual_params` must be shape (n,3) or (3,n); got {params.shape}"
+            )
+
+            # Allow a single triple to be reused for all t’s
+            if params.shape[0] == 1:
+                params = np.repeat(params, len(t_vals), axis=0)
+
+            # Otherwise require one triple per t
+            if params.shape[0] != len(t_vals):
+                raise ValueError(
+                f"`manual_params` rows ({params.shape[0]}) must equal len(t) ({len(t_vals)}) "
+                "or be a single triple."
+            )
+
+            for i, (t_val, color) in enumerate(zip(t_vals, color_cycle)):
+                mu, sigma, xi = params[i]
                 z_manual = _gev_return_level(mu, sigma, xi, T_vals)
-                ax.plot(
-                    T_vals,
-                    z_manual,
-                    linestyle=':',
-                    linewidth=2,
-                    color='red',
-                    label=f"Reference {j+1}"
-                )
+                ax.plot(T_vals, z_manual, linestyle=':', linewidth=2, color=color,
+                label=f"True, t={int(t_val)}")
+
 
         # ----------------------- Labels & title ----------------------------
         ax.set_xlabel("Return period (years)")
@@ -1338,16 +1636,11 @@ class GEVReturnLevel(GEVReturnLevelBase):
         else:
             plt.show()
 
-    def __str__(self):
-        return(str(self.summary()))
-
-class GEVReturnLevel_reparam(GEVReturnLevelBase):
-    def __init__(self, gevFit, t, s, confidence=0.95):
+class GEVReturnLevelReparam(GEVReturnLevelBase):
+    def __init__(self, gevFit, confidence=0.95):
         super().__init__(gevFit, confidence)
-        self.t = t
-        self.s = s
 
-    def return_level_at(self, t , s, confidence):
+    def return_level_at(self, t , s):
         """
         Computes the return level at a specific time point using the reparameterized approach.
         
@@ -1362,27 +1655,23 @@ class GEVReturnLevel_reparam(GEVReturnLevelBase):
         X_zp_selected = self.gevFit.gevSample.exog['location'][t,:,s]
         se = np.sqrt(np.einsum('i,ij,j->', X_zp_selected, zp_cov_matrix, X_zp_selected))
         zp = np.einsum('i,i -> ',X_zp_selected,self.gevFit.fitted_params[:i])
-        z_score = norm.ppf(1-(1-confidence)/2)
+        z_score = norm.ppf(1-(1-self.confidence)/2)
         lower_bound = zp - z_score * se
         upper_bound = zp + z_score * se
-        return se, (lower_bound.item(),upper_bound.item())
+        return zp, (lower_bound.item(),upper_bound.item())
     
-    def summary(self):
+    def compute(self, t=None, s=None):
         """
         Computes return levels and confidence intervals over multiple time points and locations.
         
         Returns:
             np.ndarray: Array of return level estimates and confidence intervals.
         """
-        if self.t is None or self.s is None or self.confidence is None:
-            raise ValueError(
-                "Return period (T), time indices (t), series indices (s), or confidence level are not set. "
-                "Please ensure these are defined before using `summary`."
-        )
 
-        # Convert to NumPy arrays for easy indexing
-        t = np.asarray(self.t)  # time indices
-        s = np.asarray(self.s)  # series indices
+        if t is None:
+            t = list(range(self.gevFit.gevSample.endog.shape[0]))
+        if s is None:
+            s = list(range(self.gevFit.gevSample.endog.shape[1]))
 
         len_t = len(t)
         len_s = len(s)
@@ -1398,7 +1687,7 @@ class GEVReturnLevel_reparam(GEVReturnLevelBase):
 
     # Step 2: Define a helper function for parallel (or serial) computation
         def compute_one(t_val, s_val):
-            z_p, (ci_low, ci_up) = self.return_level_at(t_val, s_val, confidence=self.confidence)
+            z_p, (ci_low, ci_up) = self.return_level_at(t_val, s_val)
             return (z_p, ci_low, ci_up)
 
     # Step 3: Compute return levels over all (t, s) combinations
@@ -1413,291 +1702,75 @@ class GEVReturnLevel_reparam(GEVReturnLevelBase):
         rlArray[0, :, :, 5] = results_array[:, :, 2]  # upper
 
         return rlArray
-        
-    
-    def __str__(self):
-        return(str(self.summary()))
-
-class GEV_WWA(GEV):
-      #Expected errors, the WWA function is old and derservec to be remade completely.
-    def __init__(self, endog, exog=None, loc_link=None, scale_link=None, shape_link=None, **kwargs):
-        super().__init__(endog, exog, loc_link, scale_link, shape_link, **kwargs)
-
-    def _process_data(self, endog, exog=None, **kwargs):
-        """
-        Processes and validates the endogenous and exogenous data.
-
-        Parameters
-        ----------
-        endog : array-like
-            Endogenous variable.
-        exog : dict or array-like, optional
-            Exogenous variables for parameters. Can be a single array (applied to all) or a dict with keys
-            'shape', 'location'.
-        kwargs : dict
-            Additional arguments for data handling.
-            
-        Returns
-        -------
-        dict
-            Processed data for internal use or external reference.
-        """
-        if exog is None:
-            raise ValueError(
-                "The WWA model requires exogenous data. Compatible formats are dictionaries or numpy arrays."
-            )
-
-        elif isinstance(exog, np.ndarray):
-            if exog.shape[0] != self.n_obs:
-                raise ValueError(
-                    f"The length of the provided exog array ({exog.shape[0]}) must match the length of `endog` ({self.n_obs})."
-                )
-
-            if len(exog.shape) == 1:
-                exog_augmented = exog.reshape(-1, 1)
-            else:
-                exog_augmented = exog
-
-            self.exog = {
-                "shape": np.ones((self.n_obs, 1)),
-                "scale": exog_augmented,
-                "location": exog_augmented,
-            }
-
-        elif isinstance(exog, dict):
-            self.exog = {}
-
-            if exog.get("shape") is not None:
-                raise ValueError("The WWA model does not allow a non-stationary shape.")
-
-            for key in ["shape", "scale", "location"]:
-                value = exog.get(key)
-
-                if value is None:
-                    self.exog[key] = np.ones((self.n_obs, 1))
-                else:
-                    value_array = np.asarray(value)
-                    if value_array.shape[0] != self.n_obs:
-                        raise ValueError(
-                            f"The number of rows in exog['{key}'] ({value_array.shape[0]}) "
-                            f"must match the number of rows in `endog` ({self.n_obs})."
-                        )
-                    if len(value_array.shape) == 1:
-                        self.exog[key] = value_array.reshape(-1, 1)
-                    else:
-                        self.exog[key] = value_array
-
-            # Check if 'scale' and 'location' have the same size
-            if self.exog["scale"].shape != self.exog["location"].shape:
-                raise ValueError(
-                    f"The WWA model requires 'scale' and 'location' to have the same shape, "
-                    f"but got {self.exog['scale'].shape} and {self.exog['location'].shape}."
-                )
-
-        else:
-            raise ValueError(
-                "`exog` must be either a dictionary (default) or a NumPy array of shape (n, >=1)."
-            )
-
-        # Determine if transformations are needed
-        if all(
-            np.array_equal(self.exog[key], np.ones((self.n_obs, 1)))
-            for key in ["shape", "scale", "location"]
-        ):
-            raise ValueError("The WWA model requires exogenous data for the location and the scale. Compatible formats are dictionaries or numpy arrays.")
-        else:
-            self.trans = True
-        
-        self.endog = np.asarray(endog).reshape(-1, 1)
-        self.len_exog = (self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1])
-
-
-#To be Overalled completely.
-class GEV_WWA_Likelihood(GEV_WWA):
-    def __init__(self, endog, loc_link=GEV.exp_link, scale_link=GEV.exp_link, shape_link=GEV.identity, exog={'shape': None, 'scale': None, 'location': None}, **kwargs):
-        """
-        Initializes the GEVSample model with given parameters.
-        """
-        super().__init__(endog=endog, exog=exog, loc_link=loc_link, scale_link=scale_link, shape_link=shape_link, **kwargs)
-        model_0 = GEVSample(endog=self.endog,exog={}).fit()
-        self.mu_0 = model_0.gev_params[0][0].item()
-        self.sigma_0 = model_0.gev_params[1][0].item()
-        
-    def nloglike(self, params):
-        """
-        Computes the negative log-likelihood of the GEV model.
-        """
-        # Extract the number of covariates for each parameter
-        i,_,_ = self.len_exog
-        # Compute location, scale, and shape parameters
-        location = self.mu_0 * self.loc_link(np.dot(self.exog['location'], params[:i].reshape(-1,1)) / self.mu_0)
-        scale = self.sigma_0 * self.scale_link(np.dot(self.exog['scale'], params[:i].reshape(-1,1)) / self.mu_0)
-        shape = self.shape_link(np.dot(self.exog['shape'],  params[i:].reshape(-1,1)))
-        # GEV transformation
-        normalized_data = (self.endog - location) / scale
-        transformed_data = 1 + shape * normalized_data
-        # Return a large penalty for invalid parameter values
-        if np.any(transformed_data <= 0) or np.any(scale <= 0) or np.any(shape>=0.4):
-            return 1e6
-
-        return np.sum(np.log(scale)) + np.sum(transformed_data ** (-1 / shape)) + np.sum(np.log(transformed_data) * (1 / shape + 1))
-
-    def fit(self, start_params=None, method='L-BFGS-B', **kwargs):
-        """
-        Fits the model using maximum likelihood estimation.
-
-        Parameters
-        ----------
-        start_params : array_like, optional
-            Initial guess of the solution for the loglikelihood maximization.
-            The default is an array of zeros.
-        method : str, optional
-            The `method` determines which solver from `scipy.optimize`
-            is used, and it can be chosen from among the following strings:
-
-            - 'newton' for Newton-Raphson, 'nm' for Nelder-Mead
-            - 'bfgs' for Broyden-Fletcher-Goldfarb-Shanno (BFGS)
-            - 'lbfgs' for limited-memory BFGS with optional box constraints
-            - 'powell' for modified Powell's method
-            - 'cg' for conjugate gradient
-            - 'ncg' for Newton-conjugate gradient
-            - 'basinhopping' for global basin-hopping solver
-            - 'minimize' for generic wrapper of scipy minimize (BFGS by default)
-        """
-        i,_,_ = self.len_exog
-
-        if start_params is None:
-            start_params = np.array(
-            [1]*(i) +
-            [self.shape_guess] 
-            )
-        
-        self.fitted = True
-        self.result = minimize(self.nloglike, start_params, method=method, **kwargs)
-
-        fitted_loc = self.mu_0 * self.loc_link(self.exog['location'] @ self.result.x[:i] / self.mu_0).reshape(-1,1)
-        fitted_scale = self.sigma_0 * self.scale_link(self.exog['scale'] @ self.result.x[:i] / self.mu_0).reshape(-1,1)
-        fitted_shape = self.shape_link(self.exog['shape'] @ self.result.x[i:]).reshape(-1,1)
-
-        return GEV_WWA_Fit(
-            optimize_result=self.result,
-            endog=self.endog,
-            n_obs=len(self.endog),
-            exog=self.exog,
-            len_exog=(self.exog['location'].shape[1],self.exog['scale'].shape[1],self.exog['shape'].shape[1]),
-            trans=self.trans,
-            gev_params = (fitted_loc,fitted_scale,fitted_shape),
-            mu0 = self.mu_0,
-            sigma0 = self.sigma_0
-        )
-    
-class GEV_WWA_Fit(GEVFit):
-    def __init__(self, optimize_result, endog, n_obs, exog, len_exog, trans, gev_params, mu0, sigma0):
-        super().__init__(optimize_result, endog, n_obs, exog, len_exog, trans, gev_params)
-        self.mu0 = mu0
-        self.sigma0 = sigma0
-        
-
-    #Override
-    def return_level(self, return_period, method="delta", confidence=0.95, ref_year=None):
-        if ref_year is None:
-            raise ValueError(
-                "A reference year must be provided in a non-stationary model since return levels vary over time for a given return period.")
-        elif ref_year >= self.n_obs:
-            raise ValueError(
-                "You can not get the future return levels but only present or past return levels.")
-
-        loc, scale, shape = self.gev_params[0][ref_year], self.gev_params[1][ref_year], self.gev_params[2][ref_year]
-        y_p = -np.log(1 - 1/return_period)
-        if shape == 0 or np.isclose(1/return_period, 0):
-            z_p = loc - scale * np.log(y_p)
-        else:
-            z_p = loc - (scale / shape) * (1 - y_p**(-shape))
-
-        def compute_z_p(params):
-            loc = self.mu0 * np.exp(np.dot(self.exog['location'][ref_year][0], params[0]).item() / self.mu0)
-            scale = self.sigma0 * np.exp(np.dot(self.exog['scale'][ref_year][0], params[0]).item() / self.mu0)
-            #To change for larger WWA model. 
-            shape = params[1]
-            y_p = -np.log(1 - 1/return_period)
-            if shape == 0 or np.isclose(1/return_period, 0):
-                return loc - scale * np.log(y_p)
-            else:
-                return loc - (scale / shape) * (1 - y_p**(-shape))
-        return(self._compute_confidence_interval(params=self.fitted_params,cov_matrix=self.cov_matrix,compute_z_p=compute_z_p,z_p=z_p,confidence=confidence))
-
-
-    
 
 if __name__ == "__main__":
     from scipy.stats import genextreme as gev 
+    import xarray as xr
+    from utils import *
     # ------------------------------------------------------------------
-    # 0.  Load a reference file (only for n_obs and a scale benchmark)
+    # 0.  Load a reference file  (for n_obs and a scale benchmark)
     # ------------------------------------------------------------------
     EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
-    rng   = np.random.default_rng(10)               # reproducible generator
+    rng   = np.random.default_rng(10)           # reproducible generator
 
     # ------------------------------------------------------------------
     # 1.  Dimensions & parameter ranges
     # ------------------------------------------------------------------
-    n_obs     = len(EOBS)           # same number of time steps
-    p_series  = 9                # how many independent locations
-    mu_range  = (2, 100)         # μ  ∈ [0, 40]
-    sig_range = (10.0, 50)        # σ  ∈ [10, 40]
-    xi_range  = (-0.1, 0.5)         # ξ  ∈ [–0.3, 0.3]
+    n_obs     = 100          # same number of time steps
+    p_series  = 9                   # how many independent locations
+    mu_range  = (2, 100)
+    sig_range = (10., 50.)
+    xi_range  = (-0.1, 0.5)
 
     # ------------------------------------------------------------------
-    # 2.  Generate the endogenous block  ----  shape (n_obs, p_series)
+    # 2.  Generate endogenous block  ----  shape (n_obs, p_series)
     # ------------------------------------------------------------------
     mu_vec  = rng.uniform(*mu_range,  size=p_series)
     sig_vec = rng.uniform(*sig_range, size=p_series)
     xi_vec  = rng.uniform(*xi_range,  size=p_series)
 
-    endog_data = np.empty((n_obs, p_series), dtype=float)
+    endog_data = np.empty((n_obs, p_series))
     for s in range(p_series):
-        c = -xi_vec[s]                                # SciPy’s c = –ξ
+        c  = -xi_vec[s]                              # SciPy’s c = –ξ
         rv = gev(c, loc=mu_vec[s], scale=sig_vec[s])
         endog_data[:, s] = rv.rvs(size=n_obs, random_state=rng)
 
     # ------------------------------------------------------------------
-    # 3.  Build an independent exogenous block  ----  shape (n_obs, 1, p)
-    #     (here a single covariate, independent N(0,1) then rescaled)
+    # 3.  Build an exogenous covariate block  ----  shape (n_obs, 1, p)
     # ------------------------------------------------------------------
     base_min, base_max = EOBS["tempanomalyMean"].min(), EOBS["tempanomalyMean"].max()
     width              = base_max - base_min
 
     exog_data = rng.normal(size=(n_obs, 1, p_series))
-    exog_data = base_min + 0.5 * width * exog_data     # same ballpark scale
-
-    exog_multi = {"location": exog_data, "scale": None, "shape": None}
-
-    # ------------------------------------------------------------------
-    # 4.  Fit the multi-series model
-    # ------------------------------------------------------------------
-    model_multi = GEVSample(endog=endog_data, exog=exog_multi)
-    res_multi   = model_multi.fit(fit_method="MLE")
-
-    print("=== MULTI-SERIES (100 independent GEV locations) ===")
-    print("endog shape :", model_multi.endog.shape)            # (n, 100)
-    print("exog shape  :", model_multi.exog["location"].shape) # (n, 1, 100)
-    print(res_multi, "\n")
+    exog_data = base_min + 0.5 * width * exog_data      # same ball-park scale
+    exog_multi = {"location": exog_data, "scale": exog_data, "shape": None}
 
     # ------------------------------------------------------------------
-    # 5.  Single-series benchmark (original prmax vs. tempanomaly)
+    # 4.  >>>  Gaussian-kernel weights  <<<  (n_obs, p_series)
+    #         centre weight = 1, tapering toward the ends
     # ------------------------------------------------------------------
-    endog_single = EOBS[["prmax"]].to_numpy()        # (n, 1)
-    exog_single  = {
-        "location": EOBS[["tempanomalyMean"]].to_numpy()[:, None, :]
-    }
+    centre    = (n_obs - 3) / 2
+    bandwidth = n_obs / 12                 # adjust to taste
+    x         = np.arange(n_obs)
+    w_line    = np.exp(-0.5 * ((x - centre) / bandwidth) ** 2)
+    w_line   /= w_line.max()                # max = 1
 
-    manual = [
-    [69, 13,  0.1],   # μ, σ, ξ for line 1
-    [69, 5.0, 0.1],   # μ, σ, ξ for line 2
-    ]
+    kernel_W  = np.tile(w_line[:, None], (1, p_series))  # broadcast to (n_obs, p_series)
+
+    # ------------------------------------------------------------------
+    # 5.  Fit the multi-series model with kernel weights
+    # ------------------------------------------------------------------
+    model_multi = GEV(
+        endog   = endog_data,
+        exog    = exog_multi,         # ←–––––––––––– here
+        #weights=kernel_W
+    )
+    res_multi   = model_multi.fit()
+    res_multi.plot_return_levels(T=[10,50,200],t=[1,50,99],s=0)
+
+    print("=== MULTI-SERIES (kernel weighted) ===")
+    print("endog shape :", model_multi.endog.shape)            # (n_obs, p_series)
+    print("weights  max/min :", kernel_W.max(), kernel_W.min())
+    print(res_multi)
+
     
-    model_single = GEVSample(endog=endog_single, exog=exog_single)
-    res_single   = model_single.fit(fit_method="MLE")
-    print(res_single)
-    res_single.return_level(T=[10,50,100],t=[0,20,50,74]).time_plot(manual_params=manual)
-    #print("=== SINGLE-SERIES (original data) ===")
-    #print(res_single)

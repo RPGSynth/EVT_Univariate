@@ -1,7 +1,9 @@
 # ==============================================================================
 # SECTION 0 — PYTORCH SETUP (replace JAX/Flax for sections 1–4)
 # ==============================================================================
-import os, numpy as np, torch
+import os
+import numpy as np
+import torch
 import torch.nn as tnn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
@@ -60,7 +62,7 @@ def get_simulated_data(n_samples=1000, seed=123, **kwargs):
     return locs.astype(np.float32), X_features.astype(np.float32), y
 
 # --- Data split & scaling (NumPy) ---
-locs, X, y = get_simulated_data(n_samples=1000, noise_y_std=0.8, x_slope_coeff=0.9)
+locs, X, y = get_simulated_data(n_samples=10000, noise_y_std=0.8, x_slope_coeff=0.9)
 locs_train_val, locs_test, X_train_val, X_test, y_train_val, y_test = train_test_split(
     locs, X, y, test_size=0.20, random_state=42
 )
@@ -121,12 +123,12 @@ def nll_loss_from_logits(mu_pred, log_sigma2_pred, targets):
 # --- init model/optim/dataloaders ---
 model = GlobalMLP(in_dim=X_train_t.shape[1]).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=5e-3)
-train_loader = DataLoader(train_ds, batch_size=2500, shuffle=True, drop_last=False)
+train_loader = DataLoader(train_ds, batch_size=512, shuffle=True, drop_last=False)
 
 # ==============================================================================
 # SECTION 2.1 — TRAIN LOOP (teacher)
 # ==============================================================================
-epochs, patience = 3000, 500
+epochs, patience = 500, 50
 best_val_loss, patience_counter = float('inf'), 0
 
 # snapshot best weights
@@ -217,14 +219,10 @@ print(f"Generated teacher's μ and σ for {mu_teacher_train.shape[0]} training p
 
 
 # ==============================================================================
-# SECTION 5 — k-NN NEIGHBORS (+ distance scaling)  [PyTorch]
+# SECTION 5 — UNIFORM RANDOM PAIR PICKING (no kNN) + distance scaling  [PyTorch]
 # ==============================================================================
-import torch
+import torch 
 
-EPS = 1E-8
-K_NEIGHBORS = 500  # neighbors per query for weighting
-
-# Put locations and teacher outputs on the same device
 locs_train_t = torch.from_numpy(locs_train.astype(np.float32)).to(device)   # (N,1)
 y_train_t    = torch.from_numpy(y_train.astype(np.float32)).to(device)      # (N,)
 
@@ -232,36 +230,52 @@ y_train_t    = torch.from_numpy(y_train.astype(np.float32)).to(device)      # (N
 mu_teacher_t    = torch.from_numpy(mu_teacher_train.astype(np.float32)).to(device)      # (N,)
 sigma_teacher_t = torch.from_numpy(sigma_teacher_train.astype(np.float32)).to(device)   # (N,)
 
-@torch.inference_mode()
-def pairwise_dists(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """
-    Euclidean distances with broadcasting.
-    a: (Nq, D), b: (Nr, D)  -> (Nq, Nr)
-    """
-    # torch.cdist is fine too; manual is sometimes faster for small D
-    return torch.cdist(a, b, p=2)
 
-# Compute (K+1) to include self; we’ll drop the first column
-N_train = locs_train_t.shape[0]
-K_eff = int(min(K_NEIGHBORS, max(N_train - 1, 1)))
+K_SAMPLES = 500   # number of random partners per query (was K_NEIGHBORS)
+
+@torch.inference_mode()
+def estimate_global_dist_scale(locs: torch.Tensor, num_pairs: int = 200_000) -> torch.Tensor:
+    """
+    Robust global distance scale ~ median distance over a large random set of pairs.
+    Excludes self-pairs via the 'skip self' trick.
+    """
+    N = locs.shape[0]
+    M = min(num_pairs, max(1, N * (N - 1)))
+    i = torch.randint(0, N, (M,), device=device)
+    j = torch.randint(0, N - 1, (M,), device=device)
+    j = j + (j >= i).long()  # shift to avoid j == i per element
+    d = torch.linalg.norm(locs[i] - locs[j], dim=-1)
+    return torch.median(d)
+
+def sample_uniform_partners(batch_query_idx: torch.Tensor, K: int, N: int) -> torch.Tensor:
+    """
+    For each query index in batch_query_idx (B,), sample K distinct indices
+    uniformly from {0..N-1} \ {q}, without replacement.
+    Uses a tiny per-row randperm loop (fast at typical batch sizes).
+    """
+    assert K <= max(1, N - 1), f"K={K} must be <= N-1 (N={N})"
+    device = batch_query_idx.device
+    B = batch_query_idx.shape[0]
+    partners = torch.empty((B, K), dtype=torch.long, device=device)
+    for b in range(B):
+        q = int(batch_query_idx[b].item())
+        # draw from 0..N-2, then map to 0..N-1 with "skip-self" shift
+        idx = torch.randperm(N - 1, device=device)[:K]
+        partners[b] = idx + (idx >= q)
+    return partners
+
+def rowwise_dists(locs: torch.Tensor, query_idx: torch.Tensor, partner_idx: torch.Tensor) -> torch.Tensor:
+    """
+    Compute ||loc[q] - loc[i]|| for each (q,i) pair in a batch.
+    locs: (N,D), query_idx: (B,), partner_idx: (B,K) -> (B,K)
+    """
+    qloc = locs.index_select(0, query_idx).unsqueeze(1)     # (B,1,D)
+    ploc = locs.index_select(0, partner_idx.view(-1)).view(partner_idx.shape + (locs.shape[1],))  # (B,K,D)
+    return torch.linalg.norm(ploc - qloc, dim=-1)           # (B,K)
 
 with torch.inference_mode():
-    all_d = pairwise_dists(locs_train_t, locs_train_t)              # (N,N)
-    # smallest distances → use topk on the negative
-    neg_d = -all_d
-    topk_vals, topk_idx = torch.topk(neg_d, k=K_eff + 1, dim=1)     # (N, K+1)
-    precomputed_knn_dists   = (-topk_vals)[:, 1:]                   # drop self, (N,K)
-    precomputed_knn_indices = topk_idx[:, 1:]                       # (N,K)
-
-    # Gather neighbor μ/σ for each query row
-    mu_teacher_neighbors_train    = mu_teacher_t[precomputed_knn_indices]     # (N,K)
-    sigma_teacher_neighbors_train = sigma_teacher_t[precomputed_knn_indices]  # (N,K)
-
-    # Scale distances once (after dropping self). Use median for robustness.
-    dist_scale = torch.median(precomputed_knn_dists)
-    dists_neighbors_train_scaled = precomputed_knn_dists / (dist_scale + 1e-8)
-
-print(f"k-NN ready (self excluded). Using K = {K_eff}.  Distance scaling median = {float(dist_scale):.6f}")
+    dist_scale = estimate_global_dist_scale(locs_train_t)  # scalar on device
+print(f"[Uniform] Distance scaling median = {float(dist_scale):.6f}")
 
 
 # ==============================================================================
@@ -273,33 +287,16 @@ EPS = 1e-8
 def ess_rows_from_raw(W: torch.Tensor) -> torch.Tensor:
     """
     Kish ESS per row from unnormalized weights W: ESS = (sum w)^2 / sum(w^2).
-    W: (N, K) -> (N,)
+    W: (B,K) -> (B,)
     """
     row_sum = torch.sum(W, dim=1) + EPS
     return (row_sum * row_sum) / (torch.sum(W * W, dim=1) + EPS)
-
-@torch.inference_mode()
-def mean_ess_from_params(model_weights, dists_scaled: torch.Tensor, kernel_model, sample_idx=None) -> tuple[float, torch.Tensor]:
-    """
-    Compute mean ESS on all rows or a row-subset for current kernel params.
-    dists_scaled: (N, K) on device
-    sample_idx: optional LongTensor (M,)
-    Returns (mean_ess_float, ess_vector_tensor)
-    """
-    if sample_idx is not None:
-        D = dists_scaled.index_select(0, sample_idx)
-    else:
-        D = dists_scaled
-    B, K = D.shape
-    with torch.no_grad():
-        W = kernel_model(D.reshape(-1, 1)).reshape(B, K)  # (B,K)
-    ess = ess_rows_from_raw(W)
-    return float(torch.mean(ess).item()), ess
 
 
 # ==============================================================================
 # SECTION 6 — DYNAMIC WEIGHT NET (learn w(d)) + TRAIN LOOP (ESS early stop)  [PyTorch]
 # ==============================================================================
+
 class DynamicWeightNet(tnn.Module):
     """
     Kernel network: takes scaled distance d̃ and outputs raw weight w(d̃) ∈ (0,1).
@@ -315,22 +312,16 @@ class DynamicWeightNet(tnn.Module):
             last = h
         self.backbone = tnn.Sequential(*layers)
         self.out = tnn.Linear(last, 1)
-        # initialize output bias for interpretability: sigmoid(0.8) ≈ 0.69
         with torch.no_grad():
-            self.out.bias.fill_(bias_init)
+            self.out.bias.fill_(bias_init)  # sigmoid(0.8) ~ 0.69 at init
 
     def forward(self, x):
         h = self.backbone(x)
         logits = self.out(h)
         return torch.sigmoid(logits)  # (0,1)
 
-dynamic_net = DynamicWeightNet().to(device)
-dyn_optim = torch.optim.Adam(dynamic_net.parameters(), lr=1e-4)
-
-
 def rowsum_normalize(W: torch.Tensor) -> torch.Tensor:
-    """Normalize each row to sum to 1. Returns same shape."""
-    s = torch.sum(W, dim=1, keepdim=True) + DIST_EPSILON
+    s = torch.sum(W, dim=1, keepdim=True).clamp_min(1e-8)
     return W / s
 
 def query_weighted_nll_loss(w_raw: torch.Tensor,
@@ -338,62 +329,69 @@ def query_weighted_nll_loss(w_raw: torch.Tensor,
                             sigma_n: torch.Tensor,
                             y_q: torch.Tensor) -> torch.Tensor:
     """
-    Loss per query:  Σ_i w_norm(q,i) * NLL(y_q | μ_i, σ_i); mean over batch.
+    Loss per query: Σ_i w_norm(q,i) * NLL(y_q | μ_i, σ_i); mean over batch.
     Shapes:
       w_raw:  (B,K)
       mu_n:   (B,K)
-      sigma_n:(B,K)
+      sigma_n:(B,K)      # σ (std), not variance
       y_q:    (B,)
     """
     B, K = w_raw.shape
-    w_norm = rowsum_normalize(w_raw)
+    w_norm = rowsum_normalize(w_raw)                # train-time normalization (shape learning)
     yq = y_q.view(B, 1)
-    safe_sigma = sigma_n + DIST_EPSILON
-    nll_pair = 0.5 * (np.log(2 * np.pi) + 2.0 * torch.log(safe_sigma) + ((yq - mu_n) ** 2) / (safe_sigma ** 2))
-    loss_per_q = torch.sum(w_norm * nll_pair, dim=1)  # (B,)
+    safe_sigma = sigma_n + 1e-8
+    nll_pair = 0.5 * (np.log(2 * np.pi) + 2.0 * torch.log(safe_sigma) +
+                      ((yq - mu_n) ** 2) / (safe_sigma ** 2))          # (B,K)
+    loss_per_q = torch.sum(w_norm * nll_pair, dim=1)                    # (B,)
     return torch.mean(loss_per_q)
 
+dynamic_net = DynamicWeightNet().to(device)
+dyn_optim   = torch.optim.Adam(dynamic_net.parameters(), lr=1e-4)
+
 # ESS-based early stopping config
-ESS_MIN_THRESHOLD = 100   # choose w.r.t. K (e.g., 40–150 for K=500)
+ESS_MIN_THRESHOLD = 333   # choose relative to K_SAMPLES (e.g., 40–150 for K=500)
 ESS_SAMPLE_SIZE   = 100   # number of query rows to estimate ESS each epoch
 
-# --- dynamic kernel training loop ---
-epochs, batch_size, patience = 100, 64, 1000
+# --- dynamic kernel training loop with UNIFORM pairs ---
+epochs, batch_size, patience = 500, 512, 50
 best_train_loss, patience_counter = float('inf'), 0
 best_dyn_state = {k: v.detach().cpu().clone() for k, v in dynamic_net.state_dict().items()}
 
-print(f"\nTraining dynamic model for {epochs} epochs...")
+print(f"\nTraining dynamic model (uniform pairs) for {epochs} epochs...")
 
-N = dists_neighbors_train_scaled.shape[0]
+N = locs_train_t.shape[0]
 for epoch in range(epochs):
     dynamic_net.train()
     prev_state_epoch = {k: v.detach().cpu().clone() for k, v in dynamic_net.state_dict().items()}
 
     # Shuffle queries
     perm = torch.randperm(N, device=device)
-    mu_n_shuf    = mu_teacher_neighbors_train.index_select(0, perm)
-    sigma_n_shuf = sigma_teacher_neighbors_train.index_select(0, perm)
-    d_shuf       = dists_neighbors_train_scaled.index_select(0, perm)
-    yq_shuf      = y_train_t.index_select(0, perm)
 
-    # Minibatch updates
     epoch_train_loss = 0.0
     num_batches = int(np.ceil(N / batch_size))
-    for i in range(num_batches):
-        s, e = i * batch_size, min((i + 1) * batch_size, N)
-        if s >= e:
-            continue
+    for b in range(num_batches):
+        s, e = b * batch_size, min((b + 1) * batch_size, N)
+        if s >= e: continue
 
-        mu_b    = mu_n_shuf[s:e]       # (B,K)
-        sigma_b = sigma_n_shuf[s:e]    # (B,K)
-        d_b     = d_shuf[s:e]          # (B,K)
-        yq_b    = yq_shuf[s:e]         # (B,)
+        # --- queries in this minibatch ---
+        q_idx  = perm[s:e]                               # (B,)
+        yq_b   = y_train_t.index_select(0, q_idx)        # (B,)
 
-        # forward: predict weights for all (q,i) pairs
-        W_b = dynamic_net(d_b.reshape(-1, 1)).reshape(d_b.shape)  # (B,K)
+        # --- uniformly sampled partners for these queries ---
+        i_idx  = sample_uniform_partners(q_idx, K_SAMPLES, N)     # (B,K)
 
+        # gather teacher params for partners
+        mu_b    = mu_teacher_t.index_select(0, i_idx.view(-1)).view(i_idx.shape)      # (B,K)
+        sigma_b = sigma_teacher_t.index_select(0, i_idx.view(-1)).view(i_idx.shape)   # (B,K)
+
+        # distances (scaled)
+        d_b = rowwise_dists(locs_train_t, q_idx, i_idx) / (dist_scale + 1e-8)         # (B,K)
+
+        # forward → weights
+        W_b = dynamic_net(d_b.reshape(-1, 1)).reshape(d_b.shape)                      # (B,K)
+
+        # loss & step
         loss = query_weighted_nll_loss(W_b, mu_b, sigma_b, yq_b)
-
         dyn_optim.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(dynamic_net.parameters(), max_norm=1.0)
@@ -402,22 +400,22 @@ for epoch in range(epochs):
         epoch_train_loss += loss.item()
 
         if not np.isfinite(loss.item()):
-            print(f"\n!!! Training stopped at epoch {epoch+1}, batch {i+1} due to NaN/inf loss. !!!")
+            print(f"\n!!! Training stopped at epoch {epoch+1}, batch {b+1} due to NaN/inf loss. !!!")
             break
-
     if not np.isfinite(loss.item()):
         break
 
     avg_train_loss = epoch_train_loss / num_batches
 
-    # ---- ESS check (post-epoch) ----
+    # ---- ESS check (post-epoch) on a fresh uniform sample ----
     dynamic_net.eval()
-    M = int(min(ESS_SAMPLE_SIZE, N))
-    sample_idx = torch.randperm(N, device=device)[:M]
     with torch.no_grad():
-        W_sample = dynamic_net(dists_neighbors_train_scaled.index_select(0, sample_idx).reshape(-1, 1)) \
-                     .reshape(M, K_eff)  # (M,K)
-        mean_ess = float(torch.mean(ess_rows_from_raw(W_sample)).item())
+        M = int(min(ESS_SAMPLE_SIZE, N))
+        sample_q = torch.randperm(N, device=device)[:M]                # (M,)
+        sample_i = sample_uniform_partners(sample_q, K_SAMPLES, N)     # (M,K)
+        d_s      = rowwise_dists(locs_train_t, sample_q, sample_i) / (dist_scale + 1e-8)
+        W_s      = dynamic_net(d_s.reshape(-1, 1)).reshape(M, K_SAMPLES)
+        mean_ess = float(torch.mean(ess_rows_from_raw(W_s)).item())
 
     if mean_ess < ESS_MIN_THRESHOLD:
         print(f"\n!!! Early stopping: mean ESS {mean_ess:.1f} < threshold {ESS_MIN_THRESHOLD:.1f}. "
@@ -458,87 +456,101 @@ def power_sharpness_rowsum(w_mat: torch.Tensor, alpha: float) -> torch.Tensor:
     sum_new  = torch.sum(w_pow, dim=1, keepdim=True) + EPS
     return w_pow * (sum_orig / sum_new)
 
-@torch.inference_mode()
-def ess_per_row_from_raw_np(w_row_np: np.ndarray) -> float:
-    """Kish ESS for one row from unnormalized weights (NumPy helper for the plot)."""
-    s = w_row_np.sum() + EPS
-    p = w_row_np / s
-    return float(1.0 / np.sum(p * p))
-
 
 # ==============================================================================
-# SECTION 7 — VISUALIZE THE DYNAMICALLY LEARNED WEIGHTING KERNEL  [PyTorch]
+# SECTION 7 — FULL-FIELD VIZ: weights for ALL points per frame (no subsampling)
 # ==============================================================================
-print("\n--- Generating Animation of the Learned Dynamic Kernel (PyTorch) ---")
+
+print("\n--- Generating Full-Field Animation of the Learned Dynamic Kernel ---")
 from matplotlib.animation import FuncAnimation
 
 fig_anim, ax_anim = plt.subplots(figsize=(12, 7))
 
-# Animate a subset of points across the x-domain
+# Frames: sweep across x (same selection as before)
 num_frames = 50
-sorted_indices_anim = np.argsort(X_train[:, 0])  # original NumPy X (pre-scaled) for ordering
+sorted_indices_anim = np.argsort(X_train[:, 0])  # NumPy for ordering the scatter
 sampler_indices = np.linspace(0, len(sorted_indices_anim) - 1, num_frames, dtype=int)
 indices_to_animate = sorted_indices_anim[sampler_indices]
 
-# Predict weights once (using SCALED distances for consistency with training)
-with torch.no_grad():
-    w_raw_t = dynamic_net(dists_neighbors_train_scaled.reshape(-1, 1)).reshape(N, K_eff)  # (N,K)
-# Post-training sharpness dial (identity if alpha=1)
-alpha = 1.0  # >1 sharper, <1 smoother
-with torch.no_grad():
-    w_final_t = power_sharpness_rowsum(w_raw_t, alpha)
+# Choose post-training sharpness (row-sum preserving); 1.0 = as trained
+alpha = 1.0
 
-# Move everything needed by matplotlib to CPU/NumPy
-w_final = w_final_t.detach().cpu().numpy()
-precomputed_knn_indices_np = precomputed_knn_indices.detach().cpu().numpy()
-X_train_plot = X_train  # original (NumPy) for x-axis
-y_train_plot = y_train  # original (NumPy) for y-axis
+@torch.inference_mode()
+def weights_full_field_for_query(qidx: int) -> torch.Tensor:
+    """
+    Return raw weights w(d(q, ·)) for ALL training points (N,), with the query's
+    self-weight zeroed (just for visualization so it doesn't dominate).
+    The distances are scaled by the global 'dist_scale'.
+    """
+    q = torch.tensor([qidx], device=device)
+    qloc = locs_train_t.index_select(0, q)              # (1, D)
+    d_all = torch.linalg.norm(locs_train_t - qloc, dim=-1) / (dist_scale + 1e-8)  # (N,)
+    w_all = dynamic_net(d_all.unsqueeze(1)).squeeze(1)  # (N,)
+    w_all[qidx] = 0.0                                   # drop self for viz
+    # optional: apply sharpness with row-sum preservation (treat this as one row)
+    w_all = power_sharpness_rowsum(w_all.unsqueeze(0), alpha=alpha).squeeze(0)
+    return w_all
 
-vmax = np.percentile(w_final, 99)
-num_train_points = X_train_plot.shape[0]
+# Estimate a stable color scale (vmax) from a small probe of queries
+with torch.inference_mode():
+    N = locs_train_t.shape[0]
+    Mprobe = min(50, N)                           # small probe to avoid O(N^2) pass
+    probe_idx = torch.randperm(N, device=device)[:Mprobe].tolist()
+    probe_ws = []
+    for qidx in probe_idx:
+        probe_ws.append(weights_full_field_for_query(int(qidx)))
+    probe_stack = torch.stack(probe_ws, dim=0)    # (Mprobe, N)
+    vmax = float(torch.quantile(probe_stack.flatten(), 0.99).item())
+    del probe_ws, probe_stack  # free memory
 
+num_train_points = X_train.shape[0]
 scat = ax_anim.scatter(
-    X_train_plot[:, 0], y_train_plot, c=np.zeros(num_train_points), s=35,
+    X_train[:, 0], y_train, c=np.zeros(num_train_points), s=35,
     alpha=0.8, cmap='viridis', vmin=0, vmax=vmax
 )
 fig_anim.colorbar(scat, ax=ax_anim, label='Dynamic Weight w(d)')
 
 query_highlight = ax_anim.scatter([], [], c='red', s=400, marker='*',
                                   edgecolor='black', linewidth=1.5, zorder=5, label='Query Point')
-vline = ax_anim.axvline(x=X_train_plot[0, 0], color='red', linestyle='--', lw=1.5, alpha=0.8)
+vline = ax_anim.axvline(x=X_train[0, 0], color='red', linestyle='--', lw=1.5, alpha=0.8)
 
 ax_anim.set_xlabel('Feature X (Scaled)')
 ax_anim.set_ylabel('Target y')
 ax_anim.legend()
 ax_anim.grid(True, alpha=0.4)
-title = ax_anim.set_title('Learned Dynamic Kernel', fontsize=16)
+title = ax_anim.set_title('Learned Dynamic Kernel — Full Field', fontsize=16)
 
 def update_animation(frame_index):
-    query_idx = indices_to_animate[frame_index]
-    dynamic_weights_for_query = w_final[query_idx]           # (K,)
-    neighbor_indices = precomputed_knn_indices_np[query_idx] # (K,)
+    qidx = int(indices_to_animate[frame_index])
 
-    weights_for_plotting = np.zeros(num_train_points, dtype=np.float32)
-    weights_for_plotting[neighbor_indices] = dynamic_weights_for_query
+    # Full-field weights for ALL N points against the current query
+    w_full = weights_full_field_for_query(qidx)                      # (N,) torch
+    w_np = w_full.detach().cpu().numpy()
 
-    scat.set_array(weights_for_plotting)
-    scat.set_sizes(weights_for_plotting * 200 + 15)
+    # Update scatter colors/sizes
+    scat.set_array(w_np)
+    scat.set_sizes(w_np * 200 + 15)
 
-    ess_q = ess_per_row_from_raw_np(dynamic_weights_for_query)  # per-query ESS (for display)
+    # Full-field ESS (from raw weights)
+    s = w_np.sum() + 1e-8
+    ess_q = float((s * s) / (np.sum(w_np * w_np) + 1e-8))
 
-    query_x, query_y = X_train_plot[query_idx, 0], y_train_plot[query_idx]
+    # Move markers & update title
+    query_x, query_y = X_train[qidx, 0], y_train[qidx]
     query_highlight.set_offsets([query_x, query_y])
     vline.set_xdata([query_x])
-    title.set_text(f'Learned Dynamic Kernel (Query {frame_index+1}/{num_frames})  |  ESS≈{ess_q:.1f}')
 
-    print(f"Processing animation frame {frame_index+1}/{num_frames}...")
+    title.set_text(
+        f'Full-Field Kernel (Query {frame_index+1}/{num_frames})  |  ESS≈{ess_q:.1f}'
+    )
+
+    print(f"Processing full-field frame {frame_index+1}/{num_frames}...")
     return scat, query_highlight, vline, title
 
 anim = FuncAnimation(fig_anim, update_animation, frames=len(indices_to_animate),
                      interval=200, blit=False)
-output_filename = r"c:\github\EVT_Univariate\EVT_Classes\NN\student_weight_animation_knn.gif"
+output_filename = r"c:\github\EVT_Univariate\EVT_Classes\NN\student_weight_animation_fullfield.gif"
 anim.save(output_filename, writer='pillow', fps=5)
 plt.close(fig_anim)
 
-print(f"\n✅ Animation complete! Saved as '{output_filename}'")
-
+print(f"\n✅ Full-field animation complete! Saved as '{output_filename}'")

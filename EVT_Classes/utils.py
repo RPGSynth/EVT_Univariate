@@ -1,5 +1,137 @@
-import numpy as np
+# --- Contents of utils.py ---
 import xarray as xr
+import pandas as pd
+import numpy as np
+import warnings
+from typing import Dict, Optional, List, Union
+
+import xarray as xr
+import pandas as pd
+import numpy as np
+import warnings
+from typing import Dict, Optional, List, Union
+
+def xarray_to_gev(
+    endog_da: xr.DataArray,
+    exog_ds: Optional[xr.Dataset] = None,
+    time_dim: str = 'time',
+    spatial_dims: Optional[List[str]] = None,
+    dims_as_covariates: Optional[List[str]] = None
+) -> Dict[str, Union[np.ndarray, pd.DataFrame]]:
+    """
+    (Docstring is the same as before)
+    """
+    if exog_ds is not None:
+        exog_ds = exog_ds.copy()
+    else:
+        exog_ds = xr.Dataset(coords=endog_da.coords)
+
+    if dims_as_covariates:
+        vars_to_add = {}
+        for dim_name in dims_as_covariates:
+            if dim_name in endog_da.coords:
+                coord_as_var = endog_da[dim_name]
+
+                # If it's a date, convert it to a number. The name is handled below.
+                if np.issubdtype(coord_as_var.dtype, np.datetime64):
+                    coord_as_var = (coord_as_var - coord_as_var[0]).dt.days + 1
+                
+                # --- CHANGE IS HERE ---
+                # Standardize the new variable name to always use a '_cov' suffix.
+                new_var_name = f"{dim_name}_cov"
+                # --- END OF CHANGE ---
+                
+                if new_var_name in exog_ds.data_vars:
+                    warnings.warn(f"Covariate '{new_var_name}' already exists.")
+                else:
+                    broadcasted_coord, _ = xr.broadcast(coord_as_var, endog_da)
+                    vars_to_add[new_var_name] = broadcasted_coord
+        
+        if vars_to_add:
+            exog_ds = exog_ds.assign(**vars_to_add)
+
+    if spatial_dims is None:
+        spatial_dims = [str(dim) for dim in endog_da.dims if dim != time_dim]
+
+    stacked_endog = endog_da.stack(space=spatial_dims).transpose(time_dim, 'space')
+    space_coords_df = stacked_endog.coords['space'].variable.to_index().to_frame(index=False)
+    endog_np = stacked_endog.values
+    
+    results = { 'endog': endog_np, 'spatial_coords': space_coords_df }
+
+    if exog_ds and len(exog_ds.data_vars) > 0:
+        # We need the covariate names for the inverse function. Let's add them.
+        results['covariate_names'] = list(exog_ds.data_vars)
+        stacked_exog_ds = exog_ds.stack(space=spatial_dims)
+        exog_da = stacked_exog_ds.to_array(dim='covariate')
+        exog_np = exog_da.transpose(time_dim, 'covariate', 'space').values
+        results['exog'] = exog_np
+            
+    return results
+
+def gev_to_xarray(
+    endog_flat: np.ndarray,
+    spatial_coords: pd.DataFrame,
+    exog_flat: Optional[np.ndarray] = None,
+    time_coords: Optional[Union[np.ndarray, pd.Index]] = None,
+    covariate_names: Optional[List[str]] = None,
+    time_dim_name: str = "time",
+) -> Dict[str, Union[xr.DataArray, xr.Dataset]]:
+    """
+    (Docstring is the same as before)
+    """
+    # 1. Prepare coordinates
+    if time_coords is None:
+        time_coords = np.arange(endog_flat.shape[0])
+    if len(time_coords) != endog_flat.shape[0]:
+        raise ValueError("Length of time_coords does not match time dimension of endog_flat.")
+    spatial_dim_names = spatial_coords.columns.tolist()
+    spatial_multi_index = pd.MultiIndex.from_frame(spatial_coords, names=spatial_dim_names)
+
+    # 2. Reconstruct the endogenous DataArray
+    endog_da_flat = xr.DataArray(
+        data=endog_flat,
+        dims=[time_dim_name, "space"],
+        coords={time_dim_name: time_coords, "space": spatial_multi_index},
+    )
+    endog_da = endog_da_flat.unstack("space")
+    results = {"endog_da": endog_da}
+
+    # 3. Reconstruct the exogenous Dataset (if provided)
+    if exog_flat is not None:
+        if covariate_names is None:
+             raise ValueError("`covariate_names` must be provided to reconstruct the exogenous dataset.")
+        
+        num_covariates = exog_flat.shape[1]
+        if len(covariate_names) != num_covariates:
+            raise ValueError(f"Provided {len(covariate_names)} covariate names but exog_flat has {num_covariates} covariates.")
+
+        exog_da_flat = xr.DataArray(
+            data=exog_flat,
+            dims=[time_dim_name, "covariate", "space"],
+            coords={
+                time_dim_name: time_coords,
+                "covariate": covariate_names,
+                "space": spatial_multi_index,
+            },
+        )
+        exog_da_unstacked = exog_da_flat.unstack("space")
+        
+        # --- CHANGE IS HERE ---
+        # Filter out helper covariates (ending in '_cov') before creating the Dataset
+        original_cov_names = [
+            name for name in covariate_names if not name.endswith("_cov")
+        ]
+        
+        exog_ds = xr.Dataset()
+        for cov_name in original_cov_names:
+            exog_ds[cov_name] = exog_da_unstacked.sel(covariate=cov_name, drop=True)
+        # --- END OF CHANGE ---
+
+        results["exog_ds"] = exog_ds
+
+    return results
+
 
 def xarray_to_endog_exog(ds: xr.Dataset,
                          endog_var: str,

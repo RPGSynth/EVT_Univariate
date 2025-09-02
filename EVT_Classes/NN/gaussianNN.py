@@ -23,7 +23,7 @@ DIST_EPSILON = 1e-8 # A small constant to prevent division by zero or log(0).
 # ==============================================================================
 
 # --- K-Nearest Neighbors Hyperparameter ---
-K_NEIGHBORS =  2500 #The number of nearest neighbors to consider for each point.
+K_NEIGHBORS =  250 #The number of nearest neighbors to consider for each point.
 
 def calculate_distances(point_locs, reference_locs):
     """Calculates the Euclidean distance matrix between two sets of points."""
@@ -58,7 +58,7 @@ def calculate_ols_coefficients(x_train, y_train):
     global_coeffs = np.concatenate([mu_coeffs, sigma_coeffs])
     return jnp.array(mu_coeffs), jnp.array(sigma_coeffs), jnp.array(global_coeffs)
 
-def get_simulated_data(n_samples=5000, key_data=jax.random.PRNGKey(123), **kwargs):
+def get_simulated_data(n_samples=1000, key_data=jax.random.PRNGKey(123), **kwargs):
     """Generates simulated data with non-stationary properties."""
     config = {'x_minval': -2 * jnp.pi, 'x_maxval': 2 * jnp.pi, 'curve_type': 'sin', 'amplitude': 1.5, 'frequency': 1.0, 'phase': 0.0, 'vertical_offset': 0.5, 'x_slope_coeff': 1.0, 'noise_y_std': 0.3, 'noise_beta0_std': 0.5, 'noise_beta1_std': 0.05, 'noise_type': 'wavy'}
     config.update(kwargs)
