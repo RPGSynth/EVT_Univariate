@@ -111,7 +111,6 @@ class _GEVBase(ABC):
         self.shape_link = shape_link if shape_link is not None else self.identity
         self.loc_return_level_reparam = T is not None and T>1
         if T is not None:
-            print(T)
             if T <= 1: 
                  raise ValueError("Return period T must be greater than 1 for reparameterization.")
             logging.info("ℹ️ The location parameter (μ) will be redefined in terms of return levels (z_p), "
@@ -190,8 +189,8 @@ class _GEVBase(ABC):
                 shape_zero_mask = np.isclose(shape, 0)
                 location = np.where(
                     shape_zero_mask,
-                    zp + scale * np.log(y_p), # Corrected Gumbel inversion: zp = mu - scale*log(yp) -> mu = zp + scale*log(yp) **ERROR in original code** -> mu = zp + scale * (-np.log(y_p))? No, Gumbel quantile is mu - scale*log(-log(p)). p = 1-1/T. yp = -log(1-1/T) = -log(p_exceedance). So quantile = mu - scale * log(yp). Hence mu = zp + scale*log(yp). Original was correct.
-                    zp + scale * (1 - y_p**(-shape)) / shape # GEV inversion: zp = mu + scale/shape * ((-log(1-1/T))**(-shape) - 1) -> mu = zp - scale/shape * (yp**(-shape) - 1) **ERROR in original code** -> mu = zp + scale/shape * (1 - yp**(-shape)). Original was correct.
+                    zp + scale * np.log(y_p), # Corrected Gumbel inversion: zp = mu - scale*log(yp)
+                    zp + scale * (1 - y_p**(-shape)) / shape # GEV inversion: zp = mu + scale/shape * ((-log(1-1/T))**(-shape) - 1) -> mu = zp - scale/shape * (yp**(-shape) - 1) 
                  )
 
         else:
@@ -1028,7 +1027,6 @@ class GEV(_GEVBase):
         all_param_values = np.empty((self.nparams, n))
         args = [(param_idx, n, optim_method, fitted_params,stds) for param_idx in range(self.nparams)]
         start_time = time.perf_counter()
-        print("oh")
         with ProcessPoolExecutor() as executor:
             for param_idx, profile_mles, param_values in executor.map(self._optimize_profile_parallel, args):
                 all_profile_mles[param_idx] = profile_mles
