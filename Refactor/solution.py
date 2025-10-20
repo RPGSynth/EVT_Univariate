@@ -3,36 +3,28 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
 
-import numdifftools as nd
 import numpy as np
-from scipy.optimize import approx_fprime
 from scipy.stats import norm
 
 from .likelihood import GEVLikelihood
 
-_EPS = float(np.sqrt(np.finfo(float).eps))
+
+_FD_STEP = 1e-5
 
 
 def _as_float_array(value: Sequence[float]) -> np.ndarray:
-    arr = np.asarray(value, dtype=float)
-    if arr.ndim == 0:
-        return arr.reshape(1)
-    return arr.astype(float, copy=False)
+    return np.asarray(value, dtype=float)
 
 
 def _symmetrize(matrix: np.ndarray) -> np.ndarray:
     return 0.5 * (matrix + matrix.T)
 
 
-def _ensure_scalar(array: np.ndarray) -> float:
-    value = np.asarray(array, dtype=float).ravel()
-    return float(value[0]) if value.size else float("nan")
-
-
-def _linear_predict(block: np.ndarray, params: np.ndarray) -> np.ndarray:
-    return np.tensordot(block, params, axes=([-1], [0]))
+def _ensure_1d(array: np.ndarray) -> float:
+    value = np.asarray(array, dtype=float)
+    return float(np.atleast_1d(value).ravel()[0])
 
 
 @dataclass
@@ -58,7 +50,9 @@ class GEVSolution:
         if self.params.ndim != 1:
             raise ValueError("`params` must be a one-dimensional array.")
         if self.params.size != sum(self.likelihood.len_exog):
-            raise ValueError("Parameter vector length does not match likelihood design.")
+            raise ValueError(
+                "Parameter vector length does not match the likelihood design."  # pragma: no cover
+            )
 
     # ------------------------------------------------------------------
     # Parameter bookkeeping
@@ -73,6 +67,7 @@ class GEVSolution:
 
     @property
     def param_blocks(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return the location, scale, and shape parameter blocks."""
         return self._split_params()
 
     @property
@@ -107,7 +102,7 @@ class GEVSolution:
     def effective_sample_size(self) -> float:
         weights = self.likelihood.weights
         denom = float(np.sum(weights ** 2))
-        if denom <= 0:
+        if denom == 0:
             return 0.0
         return (self.total_weight ** 2) / denom
 
@@ -120,7 +115,7 @@ class GEVSolution:
 
     @property
     def log_likelihood(self) -> float:
-        return -self.total_nll
+        return float(-self.total_nll)
 
     @property
     def aic(self) -> float:
@@ -135,43 +130,53 @@ class GEVSolution:
     def tic(self) -> float:
         return 2 * self.total_nll + 2 * self._trace_jh()
 
-    @property
-    def clic(self) -> float:
-        return 2 * self.total_nll + 2 * self._trace_jh()
-
     # ------------------------------------------------------------------
-    # Numerical differentiation utilities
+    # Numerical derivatives
     # ------------------------------------------------------------------
-    def _objective(self, theta: np.ndarray, *, weights: Optional[np.ndarray] = None) -> float:
-        return float(self.likelihood.nloglike(np.asarray(theta, dtype=float), weights=weights))
-
-    def gradient(self, params: Optional[np.ndarray] = None, *, weights: Optional[np.ndarray] = None) -> np.ndarray:
-        theta = self.params if params is None else _as_float_array(params)
-        if theta.size == 0:
-            return np.zeros_like(theta)
-        func = lambda prm: self._objective(prm, weights=weights)
-        return approx_fprime(theta, func, epsilon=_EPS)
-
     def numerical_gradient(
         self,
         func: Callable[[np.ndarray], float],
         *,
         params: Optional[np.ndarray] = None,
-        epsilon: Optional[float] = None,
+        step: float = _FD_STEP,
     ) -> np.ndarray:
         theta = self.params if params is None else _as_float_array(params)
+        grad = np.zeros_like(theta)
         if theta.size == 0:
-            return np.zeros_like(theta)
-        eps = _EPS if epsilon is None else float(epsilon)
-        wrapped = lambda prm: float(func(np.asarray(prm, dtype=float)))
-        return approx_fprime(theta, wrapped, epsilon=eps)
+            return grad
+        for idx in range(theta.size):
+            h = step if np.isfinite(theta[idx]) else _FD_STEP
+            h = max(h, _FD_STEP * max(1.0, abs(theta[idx])))
+            theta_plus = theta.copy()
+            theta_minus = theta.copy()
+            theta_plus[idx] += h
+            theta_minus[idx] -= h
+            f_plus = func(theta_plus)
+            f_minus = func(theta_minus)
+            grad[idx] = (f_plus - f_minus) / (2 * h)
+        return grad
 
-    def _hessian(self) -> np.ndarray:
+    def _objective(self, theta: np.ndarray, *, weights: Optional[np.ndarray] = None) -> float:
+        return float(self.likelihood.nloglike(theta, weights=weights))
+
+    def _gradient(self, theta: Optional[np.ndarray] = None, *, weights: Optional[np.ndarray] = None) -> np.ndarray:
+        theta_array = self.params if theta is None else _as_float_array(theta)
+        return self.numerical_gradient(lambda prm: self._objective(prm, weights=weights), params=theta_array)
+
+    def _hessian(self, *, weights: Optional[np.ndarray] = None) -> np.ndarray:
         if self.n_params == 0:
             return np.zeros((0, 0))
-        objective = lambda prm: self._objective(prm)
-        hess_fn = nd.Hessian(objective)
-        hessian = np.asarray(hess_fn(self.params), dtype=float)
+        theta = self.params
+        hessian = np.zeros((self.n_params, self.n_params), dtype=float)
+        for idx in range(self.n_params):
+            h = max(_FD_STEP, _FD_STEP * max(1.0, abs(theta[idx])))
+            theta_plus = theta.copy()
+            theta_minus = theta.copy()
+            theta_plus[idx] += h
+            theta_minus[idx] -= h
+            grad_plus = self._gradient(theta_plus, weights=weights)
+            grad_minus = self._gradient(theta_minus, weights=weights)
+            hessian[:, idx] = (grad_plus - grad_minus) / (2 * h)
         return _symmetrize(hessian)
 
     @property
@@ -180,46 +185,30 @@ class GEVSolution:
             self._hessian_cache = self._hessian()
         return self._hessian_cache
 
-    def score(self, params: Optional[np.ndarray] = None) -> np.ndarray:
-        return -self.gradient(params=params)
-
     def _score_outer(self) -> np.ndarray:
         if self._score_outer_cache is not None:
             return self._score_outer_cache
         if self.n_params == 0:
             self._score_outer_cache = np.zeros((0, 0))
             return self._score_outer_cache
-
-        weights = np.asarray(self.likelihood.weights, dtype=float)
+        weights = self.likelihood.weights
         total_weight = self.total_weight
-        if total_weight <= 0:
-            raise ValueError("Total weight must be positive to compute Godambe information.")
-
-        J = np.zeros((self.n_params, self.n_params), dtype=float)
-        for row_idx in range(self.n_obs):
-            row_weight = weights[row_idx, :]
-            W_i = float(row_weight.sum())
-            if W_i <= 0:
+        j_matrix = np.zeros((self.n_params, self.n_params), dtype=float)
+        for index, weight in np.ndenumerate(weights):
+            if weight <= 0:
                 continue
             mask = np.zeros_like(weights)
-            mask[row_idx, :] = row_weight
-            row_objective = lambda prm, m=mask: self._objective(prm, weights=m)
-            grad_i = np.asarray(nd.Gradient(row_objective)(self.params), dtype=float).reshape(-1)
-            g_i = W_i * grad_i
-            J += (1.0 / total_weight ** 2) * np.outer(g_i, g_i)
-
-        self._score_outer_cache = _symmetrize(J)
+            mask[index] = weight
+            grad_term = self._gradient(weights=mask)
+            factor = (weight / total_weight) ** 2
+            j_matrix += factor * np.outer(grad_term, grad_term)
+        self._score_outer_cache = _symmetrize(j_matrix)
         return self._score_outer_cache
 
     def _trace_jh(self) -> float:
         if self.n_params == 0:
             return 0.0
-        H = self.hessian
-        try:
-            H_inv = np.linalg.inv(H)
-        except np.linalg.LinAlgError:
-            warnings.warn("Hessian is singular; using pseudo-inverse for trace computation.", RuntimeWarning)
-            H_inv = self._pinv(H)
+        H_inv = self._pinv(self.hessian)
         return float(np.trace(self._score_outer() @ H_inv))
 
     # ------------------------------------------------------------------
@@ -234,31 +223,20 @@ class GEVSolution:
     @property
     def covariance_matrix(self) -> np.ndarray:
         if self._cov_cache is None:
-            H = self.hessian
-            try:
-                self._cov_cache = np.linalg.inv(H)
-            except np.linalg.LinAlgError:
-                warnings.warn("Hessian is singular; falling back to pseudo-inverse for covariance.", RuntimeWarning)
-                self._cov_cache = self._pinv(H)
+            self._cov_cache = self._pinv(self.hessian)
         return self._cov_cache
 
     @property
     def covariance_matrix_robust(self) -> np.ndarray:
         if self._cov_robust_cache is None:
-            H = self.hessian
-            try:
-                H_inv = np.linalg.inv(H)
-            except np.linalg.LinAlgError:
-                warnings.warn("Hessian is singular; using pseudo-inverse for robust covariance.", RuntimeWarning)
-                H_inv = self._pinv(H)
+            H_inv = self._pinv(self.hessian)
             J = self._score_outer()
-            self._cov_robust_cache = _symmetrize(H_inv @ J @ H_inv)
+            self._cov_robust_cache = H_inv @ J @ H_inv
         return self._cov_robust_cache
 
     def standard_errors(self, *, robust: bool = True) -> np.ndarray:
         cov = self.covariance_matrix_robust if robust else self.covariance_matrix
-        diag = np.clip(np.diag(cov), a_min=0.0, a_max=None)
-        return np.sqrt(diag)
+        return np.sqrt(np.clip(np.diag(cov), a_min=0.0, a_max=None))
 
     def confidence_intervals(self, *, alpha: float = 0.05, robust: bool = True) -> np.ndarray:
         z_crit = norm.ppf(1 - alpha / 2)
@@ -277,18 +255,21 @@ class GEVSolution:
 
     def summary(self, *, alpha: float = 0.05, robust: bool = True) -> str:
         stats = self.parameter_table(alpha=alpha, robust=robust)
-        header = ["Parameter", "Estimate", "Std.Err", "Z", "P>|Z|", f"{100 * (1 - alpha):.1f}% CI"]
-        lines = [f"Optimizer: {self.optimizer}", f"Converged: {self.success}"]
+        header = ["Parameter", "Estimate", "Std.Err", "Z", "P>|Z|", f"{100*(1-alpha):.1f}% CI"]
+        lines = []
+        lines.append(f"Optimizer: {self.optimizer}")
+        lines.append(f"Converged: {self.success}")
         if self.message:
             lines.append(f"Message : {self.message}")
         lines.append("")
         lines.append(f"Log-likelihood: {self.log_likelihood:.4f}")
         lines.append(f"AIC: {self.aic:.4f}  BIC: {self.bic:.4f}")
-        lines.append(f"TIC: {self.tic:.4f}  CLIC: {self.clic:.4f}")
+        lines.append(f"TIC: {self.tic:.4f}")
         lines.append("")
         lines.append(" | ".join(header))
         lines.append("-" * 72)
-        for name, row in zip(self._parameter_names(), stats):
+        names = self._parameter_names()
+        for name, row in zip(names, stats):
             est, se, z_score, p_val, lower, upper = row
             ci_str = f"({lower:.4f}, {upper:.4f})"
             lines.append(f"{name:<12} | {est:>9.4f} | {se:>8.4f} | {z_score:>6.2f} | {p_val:>7.4f} | {ci_str}")
@@ -304,30 +285,26 @@ class GEVSolution:
         return names
 
     # ------------------------------------------------------------------
-    # Fitted components
+    # Predictive utilities
     # ------------------------------------------------------------------
     def _component_surfaces(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
         if self._surface_cache is not None:
             return self._surface_cache
-
         loc_params, scale_params, shape_params = self.param_blocks
         exog = self.likelihood.exog
-
-        scale_linear = _linear_predict(exog['scale'], scale_params)
-        shape_linear = _linear_predict(exog['shape'], shape_params)
+        scale_linear = np.einsum('nij,j->ni', exog['scale'], scale_params)
+        shape_linear = np.einsum('nij,j->ni', exog['shape'], shape_params)
         scale = self.likelihood.scale_link(scale_linear)
         shape = self.likelihood.shape_link(shape_linear)
-
         if self.likelihood.loc_return_level_reparam:
-            zp_linear = _linear_predict(exog['location'], loc_params)
+            zp_linear = np.einsum('nij,j->ni', exog['location'], loc_params)
             zp = self.likelihood.loc_link(zp_linear)
             location = self.likelihood._zp_to_location(loc_params, scale, shape)
             self._surface_cache = (location, scale, shape, zp)
         else:
-            loc_linear = _linear_predict(exog['location'], loc_params)
+            loc_linear = np.einsum('nij,j->ni', exog['location'], loc_params)
             location = self.likelihood.loc_link(loc_linear)
             self._surface_cache = (location, scale, shape, None)
-
         return self._surface_cache
 
     @property
@@ -349,14 +326,12 @@ class GEVSolution:
     def _predict_triplet(self, params: np.ndarray, t: int, s: int) -> Tuple[float, float, float]:
         loc_params, scale_params, shape_params = self._split_params(params)
         exog = self.likelihood.exog
-
         loc_linear = float(np.dot(exog['location'][t, s, :], loc_params))
         scale_linear = float(np.dot(exog['scale'][t, s, :], scale_params))
         shape_linear = float(np.dot(exog['shape'][t, s, :], shape_params))
-
-        location = _ensure_scalar(self.likelihood.loc_link(np.array([loc_linear])))
-        scale = _ensure_scalar(self.likelihood.scale_link(np.array([scale_linear])))
-        shape = _ensure_scalar(self.likelihood.shape_link(np.array([shape_linear])))
+        location = _ensure_1d(self.likelihood.loc_link(np.array([loc_linear])))
+        scale = _ensure_1d(self.likelihood.scale_link(np.array([scale_linear])))
+        shape = _ensure_1d(self.likelihood.shape_link(np.array([shape_linear])))
         return location, scale, shape
 
     # ------------------------------------------------------------------
@@ -425,20 +400,17 @@ class ReturnLevelCalculatorBase:
         periods = np.atleast_1d(T).astype(float)
         t_idx = self._normalise_indices(t, self.solution.n_obs)
         s_idx = self._normalise_indices(s, self.solution.n_series)
-
         len_T, len_t, len_s = len(periods), len(t_idx), len(s_idx)
         estimates = np.empty((len_T, len_t, len_s), dtype=float)
         lower = np.empty_like(estimates)
         upper = np.empty_like(estimates)
-
         for i_T, T_val in enumerate(periods):
             for i_t, t_val in enumerate(t_idx):
                 for i_s, s_val in enumerate(s_idx):
-                    estimate, (ci_low, ci_high) = self.return_level_at(float(T_val), int(t_val), int(s_val))
+                    estimate, (ci_low, ci_high) = self.return_level_at(T_val, int(t_val), int(s_val))
                     estimates[i_T, i_t, i_s] = estimate
                     lower[i_T, i_t, i_s] = ci_low
                     upper[i_T, i_t, i_s] = ci_high
-
         return estimates, lower, upper
 
     def return_level_at(self, T: float, t: int, s: int) -> Tuple[float, Tuple[float, float]]:
@@ -446,8 +418,7 @@ class ReturnLevelCalculatorBase:
 
 
 class ReturnLevelCalculatorStandard(ReturnLevelCalculatorBase):
-    @staticmethod
-    def _gev_return_level(mu: float, sigma: float, xi: float, T: float) -> float:
+    def _gev_return_level(self, mu: float, sigma: float, xi: float, T: float) -> float:
         y_p = -np.log(1 - 1 / T)
         if np.isclose(xi, 0.0):
             return mu - sigma * np.log(y_p)
@@ -473,7 +444,7 @@ class ReturnLevelCalculatorReparam(ReturnLevelCalculatorBase):
         loc_params, _, _ = self.solution._split_params(params)
         exog_loc = self.solution.likelihood.exog['location'][t, s, :]
         linear = float(np.dot(exog_loc, loc_params))
-        return _ensure_scalar(self.solution.likelihood.loc_link(np.array([linear])))
+        return _ensure_1d(self.solution.likelihood.loc_link(np.array([linear])))
 
     def return_level_at(self, T: float, t: int, s: int) -> Tuple[float, Tuple[float, float]]:
         value = self._value(self.solution.params, t, s)
