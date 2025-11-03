@@ -105,7 +105,7 @@ def generate_gev_dataset_linear(
     beta_mu_s: float = 1.0,
     beta_mu_t: float = 0.5,
     beta_ls0: float = 0.0,
-    beta_ls_s: float = 0.0,
+    beta_ls_s: float = 0.5,
     beta_ls_t: float = 0.0,
     beta_xi0: float = 0.1,
     beta_xi_s: float = 0.0,
