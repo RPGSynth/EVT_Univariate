@@ -36,7 +36,6 @@ from typing import Dict, Tuple, TypedDict
 
 import numpy as np
 from scipy.stats import genextreme
-import gstools as gs
 import matplotlib.pyplot as plt
 
 __all__ = [
