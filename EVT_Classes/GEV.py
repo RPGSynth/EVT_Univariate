@@ -1447,7 +1447,7 @@ class GEVReturnLevel(GEVReturnLevelBase):
             return z_p, ci[0], ci[1]
 
         # Step 2: Compute return levels and CIs in parallel
-        results = Parallel(n_jobs=-1)(
+        results = Parallel(n_jobs=-1,backend='threading')(
             delayed(compute_rl)(T_val, t_val, s_val)
             for T_val in T for t_val in t for s_val in s
         )
