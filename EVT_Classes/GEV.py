@@ -83,7 +83,7 @@ class _GEVBase(ABC):
         # Add small epsilon to prevent exp(very large negative number) -> 0 issues if needed?
         # Or handle potential overflows/underflows more robustly depending on optimizer behavior.
         with np.errstate(over='ignore'): # Ignore overflow for now, optimizer might handle it
-            return np.exp(x)
+            return np.soft(x)
 
     def __init__(
         self,
@@ -1702,73 +1702,129 @@ class GEVReturnLevelReparam(GEVReturnLevelBase):
         return rlArray
 
 if __name__ == "__main__":
-    from scipy.stats import genextreme as gev 
-    import xarray as xr
-    from utils import *
-    # ------------------------------------------------------------------
-    # 0.  Load a reference file  (for n_obs and a scale benchmark)
-    # ------------------------------------------------------------------
-    EOBS = pd.read_csv(r"c:\ThesisData\EOBS\Blockmax\blockmax_temp.csv")
-    rng   = np.random.default_rng(10)           # reproducible generator
+    # Imports specific to this test
+    from scipy.stats import genextreme
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
 
-    # ------------------------------------------------------------------
-    # 1.  Dimensions & parameter ranges
-    # ------------------------------------------------------------------
-    n_obs     = 100          # same number of time steps
-    p_series  = 9                   # how many independent locations
-    mu_range  = (2, 100)
-    sig_range = (10., 50.)
-    xi_range  = (-0.1, 0.5)
+    # =============================================================================
+    # GROUND TRUTH RECOVERY TEST (MULTI-SAMPLE)
+    # =============================================================================
+    print("========================================")
+    print("  GEV MODEL: MULTI-SAMPLE RECOVERY TEST ")
+    print("========================================")
 
-    # ------------------------------------------------------------------
-    # 2.  Generate endogenous block  ----  shape (n_obs, p_series)
-    # ------------------------------------------------------------------
-    mu_vec  = rng.uniform(*mu_range,  size=p_series)
-    sig_vec = rng.uniform(*sig_range, size=p_series)
-    xi_vec  = rng.uniform(*xi_range,  size=p_series)
-
-    endog_data = np.empty((n_obs, p_series))
-    for s in range(p_series):
-        c  = -xi_vec[s]                              # SciPy’s c = –ξ
-        rv = gev(c, loc=mu_vec[s], scale=sig_vec[s])
-        endog_data[:, s] = rv.rvs(size=n_obs, random_state=rng)
-
-    # ------------------------------------------------------------------
-    # 3.  Build an exogenous covariate block  ----  shape (n_obs, 1, p)
-    # ------------------------------------------------------------------
-    base_min, base_max = EOBS["tempanomalyMean"].min(), EOBS["tempanomalyMean"].max()
-    width              = base_max - base_min
-
-    exog_data = rng.normal(size=(n_obs, 1, p_series))
-    exog_data = base_min + 0.5 * width * exog_data      # same ball-park scale
-    exog_multi = {"location": exog_data, "scale": exog_data, "shape": None}
-
-    # ------------------------------------------------------------------
-    # 4.  >>>  Gaussian-kernel weights  <<<  (n_obs, p_series)
-    #         centre weight = 1, tapering toward the ends
-    # ------------------------------------------------------------------
-    centre    = (n_obs - 3) / 2
-    bandwidth = n_obs / 12                 # adjust to taste
-    x         = np.arange(n_obs)
-    w_line    = np.exp(-0.5 * ((x - centre) / bandwidth) ** 2)
-    w_line   /= w_line.max()                # max = 1
-
-    kernel_W  = np.tile(w_line[:, None], (1, p_series))  # broadcast to (n_obs, p_series)
-
-    # ------------------------------------------------------------------
-    # 5.  Fit the multi-series model with kernel weights
-    # ------------------------------------------------------------------
-    model_multi = GEV(
-        endog   = endog_data,
-        exog    = exog_multi,         # ←–––––––––––– here
-        #weights=kernel_W
-    )
-    res_multi   = model_multi.fit()
-    res_multi.plot_return_levels(T=[10,50,200],t=[1,50,99],s=0)
-
-    print("=== MULTI-SERIES (kernel weighted) ===")
-    print("endog shape :", model_multi.endog.shape)            # (n_obs, p_series)
-    print("weights  max/min :", kernel_W.max(), kernel_W.min())
-    print(res_multi)
-
+    # 1. CONFIGURATION
+    # ----------------
+    N_OBS = 100         # 100 Time steps
+    N_SAMPLES = 5       # 5 Independent Series (e.g., 5 locations or replicates)
     
+    # Time covariate from 0 to 10
+    time_covariate = np.linspace(0, 10, N_OBS) 
+    
+    # TRUE COEFFICIENTS
+    # We assume all 5 samples follow the SAME trend (Pooling test)
+    
+    # Location = 100 + 2.5 * t
+    TRUE_MU_INTERCEPT = 100.0
+    TRUE_MU_SLOPE     = 2.5    
+    
+    # Scale = 15 + 0.5 * t
+    TRUE_SIG_INTERCEPT = 38
+    TRUE_SIG_SLOPE     = 2   
+    
+    # Shape = 0.15 (Constant)
+    TRUE_XI = 0.15 
+
+    print(f"Dimensions: {N_OBS} Observations x {N_SAMPLES} Samples")
+    print(f"TRUE Model: Mu    = {TRUE_MU_INTERCEPT} + {TRUE_MU_SLOPE}*t")
+    print(f"TRUE Model: Sigma = {TRUE_SIG_INTERCEPT} + {TRUE_SIG_SLOPE}*t")
+    print(f"TRUE Model: Xi    = {TRUE_XI}")
+
+    # 2. SIMULATION
+    # -------------
+    # Calculate the exact GEV parameters for every time step
+    # These are vectors of shape (N_OBS,)
+    mu_t = TRUE_MU_INTERCEPT + TRUE_MU_SLOPE * time_covariate
+    sigma_t = TRUE_SIG_INTERCEPT + TRUE_SIG_SLOPE * time_covariate
+    xi_t = np.full(N_OBS, TRUE_XI)
+    
+    # Generate random variable matrix (N_OBS, N_SAMPLES)
+    rng = np.random.default_rng(42)
+    endog_sim = np.zeros((N_OBS, N_SAMPLES))
+    
+    print("\nSimulating data...")
+    for i in range(N_OBS):
+        # Generate 5 random values for this specific time step
+        # params mu_t[i], sigma_t[i] are shared across all 5 samples
+        endog_sim[i, :] = genextreme.rvs(
+            c=-xi_t[i], 
+            loc=mu_t[i], 
+            scale=sigma_t[i], 
+            size=N_SAMPLES, 
+            random_state=rng
+        )
+        
+    # Create the Exogenous input
+    # We pass a 1D array for time. The class will broadcast this to (N_OBS, 1, N_SAMPLES)
+    exog_sim = {
+        'location': time_covariate,
+        'scale':    time_covariate,
+        'shape':    None 
+    }
+
+    # 3. ESTIMATION
+    # -------------
+    print("Fitting Model (MLE with pooled samples)...")
+    
+    model = GEV(
+        endog=endog_sim,
+        exog=exog_sim,
+    )
+    
+    fit_result = model.fit(optim_method='L-BFGS-B', fit_method='MLE')
+    
+    # 4. NUMERICAL COMPARISON
+    # -----------------------
+    est = fit_result.fitted_params
+    
+    true_params_vec = np.array([
+        TRUE_MU_INTERCEPT, TRUE_MU_SLOPE,
+        TRUE_SIG_INTERCEPT, TRUE_SIG_SLOPE,
+        TRUE_XI
+    ])
+    
+    print("\n--- PARAMETER RECOVERY (Pooled Fit) ---")
+    print(f"{'Param':<15} | {'True':<10} | {'Estimated':<10} | {'Error %':<10}")
+    print("-" * 55)
+    
+    param_names = ["Mu_Intercept", "Mu_Slope", "Sig_Intercept", "Sig_Slope", "Xi_Intercept"]
+    
+    for i, name in enumerate(param_names):
+        err = abs((est[i] - true_params_vec[i]) / true_params_vec[i]) * 100
+        print(f"{name:<15} | {true_params_vec[i]:<10.4f} | {est[i]:<10.4f} | {err:<10.2f}%")
+
+    # 5. VISUAL COMPARISON
+    # --------------------
+    print("\nGenerating Plot for Sample 0 (Representative)...")
+    
+    # Indices to plot (Start, Middle, End)
+    check_indices = [0, int(N_OBS/2), N_OBS-1]
+    
+    # Manual Truth for the dotted lines
+    manual_truth = []
+    for idx in check_indices:
+        manual_truth.append([mu_t[idx], sigma_t[idx], xi_t[idx]])
+    manual_truth = np.array(manual_truth)
+
+    fit_result.plot_return_levels(
+        T=np.logspace(0.1, 3, 100),
+        t=check_indices,
+        s=0, # Plot the first sample (since all 5 share the same parameters)
+        manual_params=manual_truth, 
+        title=f"Validation: {N_SAMPLES} Samples Pooled (N_OBS={N_OBS})",
+        ylabel="Simulated Value"
+    )
+    
+    print("Test Complete.")
