@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
-from .gev_link import GEVLinkage
+from ..gev_link import GEVLinkage
 
 linker = GEVLinkage()
 

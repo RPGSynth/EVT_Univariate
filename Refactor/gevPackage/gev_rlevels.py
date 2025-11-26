@@ -1,7 +1,7 @@
 import numpy as np
 import jax.numpy as jnp
 from typing import Union, TYPE_CHECKING
-from .gev_engine import compute_return_levels_batch, compute_rl_gradients_batch
+from .engines.jax_engine import compute_return_levels_batch, compute_rl_gradients_batch
 
 if TYPE_CHECKING:
     from .gev_results import GEVFit

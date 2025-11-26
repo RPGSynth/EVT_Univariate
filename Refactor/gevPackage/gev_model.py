@@ -3,7 +3,7 @@ import jax.numpy as jnp  # <--- Use JAX for linalg
 import jaxopt
 from typing import Dict, Optional
 from .gev_types import GEVInput
-from .gev_engine import nloglike_sum, compute_sandwich_matrices, linker
+from .engines.jax_engine import nloglike_sum, compute_sandwich_matrices, linker
 from .gev_results import GEVFit
 
 class GEVModel:
