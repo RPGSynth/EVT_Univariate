@@ -40,6 +40,24 @@ class GEVFit:
     @property
     def bic(self):
         return self.n_params * np.log(self.input.n_obs) + 2 * self.n_ll_total
+    
+    def return_level(self, t=None, s=None):
+        """
+        Factory method to create a ReturnLevel object for this fit.
+        """
+        # Lazy import to avoid circular dependency at top of file
+        from .gev_rlevels import ReturnLevel 
+        return ReturnLevel(self, t=t, s=s)
+    
+    @property
+    def plot(self):
+        """
+        Accessor for plotting methods.
+        Usage: fit.plot.return_levels(...)
+        """
+        # Lazy import ensures matplotlib is only loaded when needed
+        from .gev_plots import GEVPlotter 
+        return GEVPlotter(self)
 
     def plot_return_levels(self, T, t=None, s=0, show_ci=True, ax=None):
         """

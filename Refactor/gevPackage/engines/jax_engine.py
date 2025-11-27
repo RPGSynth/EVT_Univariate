@@ -136,33 +136,73 @@ def compute_sandwich_matrices(params, endog, exog_loc, exog_scale, exog_shape, w
     
     return H, B
 
-def return_level_scalar(params, x_loc, x_scale, x_shape, T, dims, reparam_T):
-    mu, sigma, xi = predict_parameters(params, x_loc, x_scale, x_shape, dims, reparam_T)
+def return_level_atomic(params, x_l, x_s, x_x, T, dims, reparam_T):
+    # predict_parameters expects (Time, Space, Covariates) -> (N, S, K)
+    # x_l coming in is just (K,). 
+    # We must expand it to (1, 1, K) to satisfy 'nsk' in einsum.
+    
+    mu, sigma, xi = predict_parameters(
+        params, 
+        x_l[None, None, :],  # Added extra None
+        x_s[None, None, :],  # Added extra None
+        x_x[None, None, :],  # Added extra None
+        dims, 
+        reparam_T
+    )
+    
+    # The output shape will be (1, 1) because of the fake dims.
+    # We squeeze it completely to get a scalar () for the math below.
+    mu = jnp.squeeze(mu)
+    sigma = jnp.squeeze(sigma)
+    xi = jnp.squeeze(xi)
+    # --- FIX END ---
     
     y = -jnp.log(1.0 - 1.0/T)
     
+    # Gumbel Logic
     rl_gumbel = mu - sigma * jnp.log(y)
     
+    # GEV Logic
     xi_safe = jnp.where(jnp.abs(xi) < 1e-5, 1.0, xi)
     term = jnp.exp(-xi_safe * jnp.log(y))
     rl_gev = mu - (sigma / xi_safe) * (1.0 - term)
     
-    is_gumbel = jnp.abs(xi) < 1e-5
-    result = jnp.where(is_gumbel, rl_gumbel, rl_gev)
-    
-    # --- CRITICAL FIX: Force result to be a scalar ---
-    # Input shapes were (1,1), so result is (1,1).
-    # jax.grad requires shape ().
-    return jnp.squeeze(result)
+    # Select
+    result = jnp.where(jnp.abs(xi) < 1e-5, rl_gumbel, rl_gev)
+    return result
+
+# --- 2. The Vectorization (Double Vmap) ---
+
+# Inner Vmap: Vectorize over T (Return Periods)
+# Input: (K), (K), (K), (N_periods) -> Output: (N_periods)
+rl_over_periods = jax.vmap(
+    return_level_atomic, 
+    in_axes=(None, None, None, None, 0, None, None)
+)
+
+# Outer Vmap: Vectorize over Data Indices (Batch of t/s)
+# Input: (Batch, K), (Batch, K), (Batch, K), (N_periods) -> Output: (Batch, N_periods)
+rl_batch_2d = jax.vmap(
+    rl_over_periods,
+    in_axes=(None, 0, 0, 0, None, None, None)
+)
+
+# Gradient Vmap: Same logic, but applied to grad()
+grad_atomic = jax.grad(return_level_atomic, argnums=0)
+grad_over_periods = jax.vmap(grad_atomic, in_axes=(None, None, None, None, 0, None, None))
+grad_batch_2d = jax.vmap(grad_over_periods, in_axes=(None, 0, 0, 0, None, None, None))
 
 @partial(jax.jit, static_argnames=('dims', 'reparam_T'))
-def compute_return_levels_batch(params, x_loc, x_scale, x_shape, T_array, dims, reparam_T=None):
-    return jax.vmap(return_level_scalar, in_axes=(None, None, None, None, 0, None, None))(
-        params, x_loc, x_scale, x_shape, T_array, dims, reparam_T
-    )
-
-@partial(jax.jit, static_argnames=('dims', 'reparam_T'))
-def compute_rl_gradients_batch(params, x_loc, x_scale, x_shape, T_array, dims, reparam_T=None):
-    return jax.vmap(jax.grad(return_level_scalar, argnums=0), in_axes=(None, None, None, None, 0, None, None))(
-        params, x_loc, x_scale, x_shape, T_array, dims, reparam_T
-    )
+def compute_return_levels_general(params, x_l, x_s, x_x, T_array, dims, reparam_T=None):
+    """
+    Computes Point Estimates and Gradients in one highly optimized pass.
+    Inputs:
+        x_l, x_s, x_x: Shape (N_batch, K_covariates)
+        T_array: Shape (N_periods,)
+    Returns:
+        zp: (N_batch, N_periods)
+        grads: (N_batch, N_periods, N_params)
+    """
+    zp = rl_batch_2d(params, x_l, x_s, x_x, T_array, dims, reparam_T)
+    grads = grad_batch_2d(params, x_l, x_s, x_x, T_array, dims, reparam_T)
+    return zp, grads

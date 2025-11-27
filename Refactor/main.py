@@ -6,6 +6,7 @@ from scipy.stats import genextreme
 # If running inside the folder, use local imports, but here is the standard way:
 from gevPackage import GEVModel
 from gevPackage import GEVLinkage
+from gevPackage import ReturnLevel
 
 def generate_synthetic_data(n_obs=20, n_samples=10):
     """
@@ -35,13 +36,13 @@ def generate_synthetic_data(n_obs=20, n_samples=10):
     # --- 2. Define Ground Truth Coefficients ---
     
     # Location: Mu = 100 + 10 * Temp (+ 5 * Elev IF S > 1)
-    mu_true = 100.0 + 10 * X_temp 
+    mu_true = 100.0 + 1 * X_temp 
     if not is_single_sample:
         mu_true += 5.0 * X_elev
     
     # Scale: Sigma = Softplus( 2.0 + 0.05 * Temp )
     linker = GEVLinkage()
-    lin_scale = 2.0 + 3 * X_temp
+    lin_scale = 2.0 + 0.5 * X_temp
     sigma_true = linker.np_transform_scale(lin_scale)
     
     # Shape: Xi = 0.15
@@ -63,7 +64,7 @@ def generate_synthetic_data(n_obs=20, n_samples=10):
         exog_loc_final = np.stack([cov1, cov2], axis=2) # Shape (N, S, 2)
     
     final_exog = {
-        'location': cov1,
+        'location': exog_loc_final,
         'scale': cov1,       # 1 Covariate (Temp)
         'shape': None        # Intercept only
     }
@@ -76,12 +77,12 @@ def main():
     print("==========================================")
     
     # 1. Generate Data
-    N, S = 100,1
+    N, S = 100,9
     print(f"Generating data: {N} obs, {S} samples...")
     endog, exog, truths = generate_synthetic_data(N, S)
     
     # 2. Initialize Model
-    model = GEVModel(max_iter=10000,reparam_T=10000)
+    model = GEVModel(max_iter=5000)
     
     # 3. Fit
     print("\nFitting Model...")
@@ -121,16 +122,41 @@ def main():
     # --- Shape ---
     print(f"Shape Intercept(True 0.15): {est[offset+d_s]:.4f}")
     
-    # 6. Plotting (API Test)
-    print("\nGenerating Plots...")
-    # Plot return levels for the first station (s=0) 
-    # at start (t=0), middle (t=50), and end (t=99)
-    fig, ax = result.plot_return_levels(
-        T=[10,50,70,100,250,500,1000,5000,10000], 
-        t=[10, 50,99], 
+    z,se = result.return_level(t=[1,10],s=0).compute([10,100])
+    print(z.shape)
+    
+    ax = result.plot.return_levels(
+        T=[10,50,100,200,500,1000,5000], 
+        t=[0, N-1], 
         s=0
     )
     plt.show()
+    
+    np.random.seed(999)
+    random_x = np.random.uniform(0, 100, S)
+    random_y = np.random.uniform(0, 100, S)
 
+    # This works perfectly:
+    ax = result.plot.spatial_map(
+        T=100, 
+        coordinates=(random_x, random_y), # <--- Irregular inputs
+        cmap='viridis'
+    )
+    plt.show()
+    
+    # --- C. SPATIAL MAP: HEATMAP (Grid Shape) ---
+    print("Plotting 3: Spatial Grid Heatmap...")
+    
+    # Plot the same data but as a continuous field
+    result.plot.spatial_map(
+        T=100,
+        t=0,
+        grid_shape=(3, 3), 
+        cmap='magma',
+        interpolation='nearest', # or 'bicubic' for smooth look
+        figsize=(7, 6)
+    )
+    plt.title("Spatial Heatmap: 100-Year RL (Grid)")
+        
 if __name__ == "__main__":
     main()
