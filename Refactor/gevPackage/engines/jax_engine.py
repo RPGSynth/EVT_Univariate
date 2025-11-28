@@ -37,20 +37,34 @@ def predict_parameters(params, exog_loc, exog_scale, exog_shape, dims, reparam_T
     beta_loc, beta_scale, beta_shape = linker.forward(params, dims)
     
     # 1. Calculate the raw first parameter (either Mu or Zp)
+<<<<<<< Updated upstream
     # Note: beta_loc here might be beta_zp if reparam_T is set.
+=======
+>>>>>>> Stashed changes
     lin_loc = jnp.einsum('nsk,k->ns', exog_loc, beta_loc)
     
     # 2. Calculate Scale and Shape
     lin_scale = jnp.einsum('nsk,k->ns', exog_scale, beta_scale)
     sigma = linker.transform_scale(lin_scale)
+<<<<<<< Updated upstream
+=======
+    
+>>>>>>> Stashed changes
     xi = jnp.einsum('nsk,k->ns', exog_shape, beta_shape)
     
     # 3. Handle Reparameterization
     if reparam_T is not None:
+<<<<<<< Updated upstream
         # lin_loc is actually Zp. Convert to Mu.
         mu = zp_to_mu(lin_loc, sigma, xi, reparam_T)
     else:
         # lin_loc is Mu.
+=======
+        # val_1 is actually Zp. Convert to Mu.
+        mu = zp_to_mu(lin_loc, sigma, xi, reparam_T)
+    else:
+        # val_1 is Mu.
+>>>>>>> Stashed changes
         mu = lin_loc
         
     return mu, sigma, xi
@@ -116,11 +130,19 @@ def compute_sandwich_matrices(params, endog, exog_loc, exog_scale, exog_shape, w
     def row_term_func(params, y_row, exog_loc_row, exog_scale_row, exog_shape_row, w_row):
         # Calculate NLL for this row, weight it, and scale by 1/W_total
         nll_val = nloglike_sum(
+<<<<<<< Updated upstream
             params,
             y_row[None, :], 
             exog_loc_row[None, ...],
             exog_scale_row[None, ...],
             exog_shape_row[None, ...],
+=======
+            params, 
+            y_row[None, :], 
+            exog_loc_row[None, ...], 
+            exog_scale_row[None, ...], 
+            exog_shape_row[None, ...], 
+>>>>>>> Stashed changes
             w_row[None, :], 
             dims,
             reparam_T
@@ -139,7 +161,11 @@ def compute_sandwich_matrices(params, endog, exog_loc, exog_scale, exog_shape, w
 
 def return_level_atomic(params, exog_loc, exog_scale, exog_shape, T, dims, reparam_T):
     # predict_parameters expects (Time, Space, Covariates) -> (N, S, K)
+<<<<<<< Updated upstream
     # exog_loc coming in is just (K,).
+=======
+    # exog_loc coming in is just (K,). 
+>>>>>>> Stashed changes
     # We must expand it to (1, 1, K) to satisfy 'nsk' in einsum.
     
     mu, sigma, xi = predict_parameters(

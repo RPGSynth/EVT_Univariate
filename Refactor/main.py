@@ -133,31 +133,5 @@ def main():
     )
     plt.show()
     
-    np.random.seed(999)
-    random_x = np.random.uniform(0, 100, S)
-    random_y = np.random.uniform(0, 100, S)
-
-    # This works perfectly:
-    ax = result.plot.spatial_map(
-        T=100, 
-        coordinates=(random_x, random_y), # <--- Irregular inputs
-        cmap='viridis'
-    )
-    plt.show()
-    
-    # --- C. SPATIAL MAP: HEATMAP (Grid Shape) ---
-    print("Plotting 3: Spatial Grid Heatmap...")
-    
-    # Plot the same data but as a continuous field
-    result.plot.spatial_map(
-        T=100,
-        t=0,
-        grid_shape=(3, 3), 
-        cmap='magma',
-        interpolation='nearest', # or 'bicubic' for smooth look
-        figsize=(7, 6)
-    )
-    plt.title("Spatial Heatmap: 100-Year RL (Grid)")
-        
 if __name__ == "__main__":
     main()
