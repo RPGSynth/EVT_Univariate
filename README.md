@@ -1,13 +1,33 @@
-# 🌟 PhD Paper Scripts Repository 🌟
+# 🌞 PhD Paper Scripts Repository 🌞
 
-Welcome to the repository for my **first PhD paper**. This repository contains a collection of useful scripts, organized by project, each with its own specific work plan. The structure is designed to facilitate efficient research and exploration across various subtopics related to my PhD work.
+Welcome to the sunny codebase behind my **first PhD paper** on extreme events.  
+Every folder is a small lab: some hold production-ready GEV code, others are sandboxes for simulations, neural kernels, or data-import helpers. Enjoy the stroll!
 
-## Repository Structure
-Each project within this repository will have its own dedicated folder, including detailed work plans and scripts tailored to that specific research focus.
+---
 
-### Current Projects:
-#### 1. 📊 **GEV-Exploration**
-- This project focuses on the **Generalized Extreme Value (GEV)** distribution and its application in extreme value analysis.
-- The work plan involves model fitting, diagnostics, and exploration of trends within the context of climate data.
-  
-Stay tuned for more projects as my research progresses!
+## ✨ What’s Inside
+
+| Area | What it is | Key entry points |
+| --- | --- | --- |
+| **EVT_Classes/** | Legacy/statistical workflows plus neural-kernel experiments. | `GEV.py`, `utils.py`, `SIM/` simulator + notebook, `NN/` experiments. |
+| **Refactor/** | Modern GEV API powered by JAX/JAXopt. | `gevPackage/` modules; demo in `Refactor/main.py`. |
+| **Exploration/** | Work-plan notes for the broader project. | `Exploration/README.md`. |
+| **Import/** | Download helpers for climate datasets (EOBS, CMIP-S). | `import_EOBS.py`, `import_CMISP.py`, bash `sh/` script. |
+| **outputs** | Example animations/plots from notebooks. | `EVT_Classes/SIM/*.gif`, `output.png`. |
+
+---
+
+## 🚀 Quickstart (Refactored GEV API)
+
+1. **Environment**
+   ```bash
+   conda create -n phd python=3.11
+   conda activate phd
+   pip install jax jaxlib jaxopt numpy scipy matplotlib pandas
+
+## ⭐ Centerpiece: Weighted Neural Kernel for Return Levels
+The repo’s signature idea is a **weighted neural-kernel approach** that learns distance→weight functions to bias GEV fits toward relevant space–time neighborhoods. You’ll find the working code and demos here:
+
+- **Simulation + notebooks:** `EVT_Classes/SIM/sim.ipynb` (uses a trained `DynamicWeightNet` to build weights and fit GEVs).
+
+If you’re here for the novelty, Open `EVT_Classes/SIM/sim.ipynb` to see the weights driving the GEV fits and return-level plots.
