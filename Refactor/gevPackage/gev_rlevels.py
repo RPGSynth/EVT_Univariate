@@ -53,17 +53,10 @@ class ReturnLevel:
         flat_t = self.t_grid.ravel()
         flat_s = self.s_grid.ravel()
 
-<<<<<<< Updated upstream
         data = self.fit.data
         self.exog_loc = jnp.array(data.exog_loc[flat_t, flat_s, :], dtype=float)
         self.exog_scale = jnp.array(data.exog_scale[flat_t, flat_s, :], dtype=float)
         self.exog_shape = jnp.array(data.exog_shape[flat_t, flat_s, :], dtype=float)
-=======
-        inp = self.fit.input
-        self.exog_loc = jnp.array(inp.exog_loc[flat_t, flat_s, :], dtype=float)
-        self.exog_scale = jnp.array(inp.exog_scale[flat_t, flat_s, :], dtype=float)
-        self.exog_shape = jnp.array(inp.exog_shape[flat_t, flat_s, :], dtype=float)
->>>>>>> Stashed changes
 
     def compute(self, T):
         """
