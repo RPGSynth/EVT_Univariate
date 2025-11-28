@@ -16,11 +16,11 @@ class GEVLinkage:
         d_loc, d_scale, d_shape = dims
         
         # Slicing the flat vector based on the tuple dimensions
-        p_loc   = params_flat[:d_loc]
-        p_scale = params_flat[d_loc : d_loc + d_scale]
-        p_shape = params_flat[d_loc + d_scale :]
+        beta_loc   = params_flat[:d_loc]
+        beta_scale = params_flat[d_loc : d_loc + d_scale]
+        beta_shape = params_flat[d_loc + d_scale :]
         
-        return p_loc, p_scale, p_shape
+        return beta_loc, beta_scale, beta_shape
 
     def transform_scale(self, lin_pred_scale):
         """

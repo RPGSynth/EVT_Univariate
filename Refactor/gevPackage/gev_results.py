@@ -8,38 +8,38 @@ class GEVFit:
     Container for the results of a GEV optimization.
     Replaces the old 'GEVFit' class, handling AIC/BIC and Summary formatting.
     """
-    def __init__(self, params, cov_matrix, n_ll_avg, input_data, linker,reparam_T=None):
+    def __init__(self, params, cov_matrix, nll_avg, data, linker,reparam_T=None):
         self.params = np.asarray(params)
         self.cov_matrix = np.asarray(cov_matrix)
         diag_cov = np.diag(self.cov_matrix)
         safe_diag = np.where(diag_cov >= 0, diag_cov, np.nan)
         self.se = np.sqrt(safe_diag)
-        self.n_ll_avg = float(n_ll_avg)
-        self.input = input_data
+        self.nll_avg = float(nll_avg)
+        self.data = data
         self.linker = linker
         self.reparam_T = reparam_T
         
         # Dimensions derived from input data
-        self.dims = self.input.covariate_dims
-        self.n_obs = input_data.n_obs
+        self.dims = self.data.covariate_dims
+        self.n_obs = data.n_obs
 
     @property
     def n_params(self):
         return self.params.size
     
     @property
-    def n_ll_total(self):
+    def nll_total(self):
         """Recover total NLL from the average."""
-        W_total = np.sum(self.input.weights)
-        return self.n_ll_avg * W_total
+        W_total = np.sum(self.data.weights)
+        return self.nll_avg * W_total
     
     @property
     def aic(self):
-        return 2 * self.n_params + 2 * self.n_ll_total
+        return 2 * self.n_params + 2 * self.nll_total
     
     @property
     def bic(self):
-        return self.n_params * np.log(self.input.n_obs) + 2 * self.n_ll_total
+        return self.n_params * np.log(self.data.n_obs) + 2 * self.nll_total
     
     def return_level(self, t=None, s=None, confidence=0.95):
         """
@@ -72,7 +72,7 @@ class GEVFit:
         
         if t is None:
             # Default to start, middle, end
-            t = [0, self.input.n_obs // 2, self.input.n_obs - 1]
+            t = [0, self.data.n_obs // 2, self.data.n_obs - 1]
         
         if not isinstance(t, list):
             t = [t]
@@ -140,9 +140,9 @@ class GEVFit:
             "\n" + "="*width,
             f"{'GEV FIT RESULTS (JAX Engine)':^{width}}",
             "="*width,
-            f"Nobs: {self.n_obs:<10} | Nsamples: {self.input.n_samples:<10}",
-            f"NLL: {self.n_ll_total:.2f}",
-            f"Average NLL: {self.n_ll_avg:.2f}",
+            f"Nobs: {self.n_obs:<10} | Nsamples: {self.data.n_samples:<10}",
+            f"NLL: {self.nll_total:.2f}",
+            f"Average NLL: {self.nll_avg:.2f}",
             f"AIC: {self.aic:.2f}        | BIC: {self.bic:.2f}",
         ]
         

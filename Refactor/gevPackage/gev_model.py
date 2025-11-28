@@ -58,8 +58,8 @@ class GEVModel:
         return GEVFit(
             params=np.array(res.params),       # JAX -> NumPy
             cov_matrix=np.array(cov_matrix_jax), # JAX -> NumPy
-            n_ll_avg=float(res.state.value),   # JAX scalar -> Python float
-            input_data=data,
+            nll_avg=float(res.state.value),   # JAX scalar -> Python float
+            data=data,
             linker=linker,
             reparam_T=self.reparam_T
         )

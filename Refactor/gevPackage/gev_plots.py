@@ -194,7 +194,7 @@ class GEVPlotter:
             raise ValueError("Provide 'coordinates' OR 'grid_shape', not both.")
 
         # 2. Setup S (All sites by default)
-        n_samples = self.fit.input.n_samples
+        n_samples = self.fit.data.n_samples
         s_indices = np.arange(n_samples)
         
         # 3. Compute (Using the Factory)
@@ -202,7 +202,7 @@ class GEVPlotter:
         rl_obj = self.fit.return_level(t=t, s=s_indices)
         
         # Result shape: (1, S, 1) because t=scalar, s=vector, T=scalar
-        levels, _ = rl_obj.compute([T])
+        levels, _, _ = rl_obj.compute([T])
         
         # Flatten to (S,)
         values = levels.flatten()

@@ -53,10 +53,10 @@ class ReturnLevel:
         flat_t = self.t_grid.ravel()
         flat_s = self.s_grid.ravel()
 
-        inp = self.fit.input
-        self.x_l = jnp.array(inp.exog_loc[flat_t, flat_s, :], dtype=float)
-        self.x_s = jnp.array(inp.exog_scale[flat_t, flat_s, :], dtype=float)
-        self.x_x = jnp.array(inp.exog_shape[flat_t, flat_s, :], dtype=float)
+        data = self.fit.data
+        self.exog_loc = jnp.array(data.exog_loc[flat_t, flat_s, :], dtype=float)
+        self.exog_scale = jnp.array(data.exog_scale[flat_t, flat_s, :], dtype=float)
+        self.exog_shape = jnp.array(data.exog_shape[flat_t, flat_s, :], dtype=float)
 
     def compute(self, T):
         """
@@ -85,9 +85,9 @@ class ReturnLevel:
         #    grads_flat: (Batch, N_periods, N_params)
         zp_flat, grads_flat = compute_return_levels_general(
             self.params_j,
-            self.x_l,
-            self.x_s,
-            self.x_x,
+            self.exog_loc,
+            self.exog_scale,
+            self.exog_shape,
             T_array,
             self.fit.dims,
             reparam_T=self.reparam_T,

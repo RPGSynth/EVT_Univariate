@@ -34,23 +34,24 @@ def predict_parameters(params, exog_loc, exog_scale, exog_shape, dims, reparam_T
     Reconstructs mu, sigma, xi. 
     If reparam_T is set, 'mu' is calculated from the predicted Zp.
     """
-    p_1, p_scale, p_shape = linker.forward(params, dims)
+    beta_loc, beta_scale, beta_shape = linker.forward(params, dims)
     
     # 1. Calculate the raw first parameter (either Mu or Zp)
-    val_1 = jnp.einsum('nsk,k->ns', exog_loc, p_1)
+    # Note: beta_loc here might be beta_zp if reparam_T is set.
+    lin_loc = jnp.einsum('nsk,k->ns', exog_loc, beta_loc)
     
     # 2. Calculate Scale and Shape
-    lin_scale = jnp.einsum('nsk,k->ns', exog_scale, p_scale)
+    lin_scale = jnp.einsum('nsk,k->ns', exog_scale, beta_scale)
     sigma = linker.transform_scale(lin_scale)
-    xi = jnp.einsum('nsk,k->ns', exog_shape, p_shape)
+    xi = jnp.einsum('nsk,k->ns', exog_shape, beta_shape)
     
     # 3. Handle Reparameterization
     if reparam_T is not None:
-        # val_1 is actually Zp. Convert to Mu.
-        mu = zp_to_mu(val_1, sigma, xi, reparam_T)
+        # lin_loc is actually Zp. Convert to Mu.
+        mu = zp_to_mu(lin_loc, sigma, xi, reparam_T)
     else:
-        # val_1 is Mu.
-        mu = val_1
+        # lin_loc is Mu.
+        mu = lin_loc
         
     return mu, sigma, xi
 
@@ -112,14 +113,14 @@ def compute_sandwich_matrices(params, endog, exog_loc, exog_scale, exog_shape, w
     
     # 3. Gradients of individual terms (The Meat)
     # We need the gradient of (w_i * l_i / W_total) for each observation
-    def row_term_func(p, y_row, x_l_row, x_s_row, x_x_row, w_row):
+    def row_term_func(params, y_row, exog_loc_row, exog_scale_row, exog_shape_row, w_row):
         # Calculate NLL for this row, weight it, and scale by 1/W_total
         nll_val = nloglike_sum(
-            p, 
+            params,
             y_row[None, :], 
-            x_l_row[None, ...], 
-            x_s_row[None, ...], 
-            x_x_row[None, ...], 
+            exog_loc_row[None, ...],
+            exog_scale_row[None, ...],
+            exog_shape_row[None, ...],
             w_row[None, :], 
             dims,
             reparam_T
@@ -136,16 +137,16 @@ def compute_sandwich_matrices(params, endog, exog_loc, exog_scale, exog_shape, w
     
     return H, B
 
-def return_level_atomic(params, x_l, x_s, x_x, T, dims, reparam_T):
+def return_level_atomic(params, exog_loc, exog_scale, exog_shape, T, dims, reparam_T):
     # predict_parameters expects (Time, Space, Covariates) -> (N, S, K)
-    # x_l coming in is just (K,). 
+    # exog_loc coming in is just (K,).
     # We must expand it to (1, 1, K) to satisfy 'nsk' in einsum.
     
     mu, sigma, xi = predict_parameters(
         params, 
-        x_l[None, None, :],  # Added extra None
-        x_s[None, None, :],  # Added extra None
-        x_x[None, None, :],  # Added extra None
+        exog_loc[None, None, :],  # Added extra None
+        exog_scale[None, None, :],  # Added extra None
+        exog_shape[None, None, :],  # Added extra None
         dims, 
         reparam_T
     )
@@ -193,16 +194,16 @@ grad_over_periods = jax.vmap(grad_atomic, in_axes=(None, None, None, None, 0, No
 grad_batch_2d = jax.vmap(grad_over_periods, in_axes=(None, 0, 0, 0, None, None, None))
 
 @partial(jax.jit, static_argnames=('dims', 'reparam_T'))
-def compute_return_levels_general(params, x_l, x_s, x_x, T_array, dims, reparam_T=None):
+def compute_return_levels_general(params, exog_loc, exog_scale, exog_shape, T_array, dims, reparam_T=None):
     """
     Computes Point Estimates and Gradients in one highly optimized pass.
     Inputs:
-        x_l, x_s, x_x: Shape (N_batch, K_covariates)
+        exog_loc, exog_scale, exog_shape: Shape (N_batch, K_covariates)
         T_array: Shape (N_periods,)
     Returns:
         zp: (N_batch, N_periods)
         grads: (N_batch, N_periods, N_params)
     """
-    zp = rl_batch_2d(params, x_l, x_s, x_x, T_array, dims, reparam_T)
-    grads = grad_batch_2d(params, x_l, x_s, x_x, T_array, dims, reparam_T)
+    zp = rl_batch_2d(params, exog_loc, exog_scale, exog_shape, T_array, dims, reparam_T)
+    grads = grad_batch_2d(params, exog_loc, exog_scale, exog_shape, T_array, dims, reparam_T)
     return zp, grads
