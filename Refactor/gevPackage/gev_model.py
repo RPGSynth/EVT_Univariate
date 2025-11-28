@@ -23,7 +23,6 @@ class GEVModel:
         W_total = np.sum(data.weights)
         
         # 2. Init Guess
-        print("Initializing...")
         init_params = linker.initial_guess(data.endog, dims, self.reparam_T)
         
         # 3. Define Objective
@@ -34,12 +33,10 @@ class GEVModel:
             return nll_sum / W_total
             
         # 4. Optimize (JAX)
-        print(f"Optimizing (Avg NLL) with L-BFGS...")
         solver = jaxopt.LBFGS(fun=objective, maxiter=self.max_iter, tol=1e-12)
         res = solver.run(init_params)
         
         # 5. Sandwich Covariance (JAX)
-        print("Calculating Covariance...")
         # H and B are JAX arrays here
         H, B = compute_sandwich_matrices(
             res.params, data.endog, data.exog_loc, data.exog_scale, data.exog_shape, data.weights, dims,reparam_T=self.reparam_T

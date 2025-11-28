@@ -41,13 +41,13 @@ class GEVFit:
     def bic(self):
         return self.n_params * np.log(self.input.n_obs) + 2 * self.n_ll_total
     
-    def return_level(self, t=None, s=None):
+    def return_level(self, t=None, s=None, confidence=0.95):
         """
         Factory method to create a ReturnLevel object for this fit.
         """
         # Lazy import to avoid circular dependency at top of file
         from .gev_rlevels import ReturnLevel 
-        return ReturnLevel(self, t=t, s=s)
+        return ReturnLevel(self, t=t, s=s, confidence=confidence)
     
     @property
     def plot(self):

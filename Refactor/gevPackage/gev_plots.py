@@ -16,38 +16,48 @@ class GEVPlotter:
         self.fit = fit_obj
 
     def return_levels(self,
-                      T: Union[List[float], np.ndarray],
-                      t: Union[int, List[int], None] = None,
-                      s: int = 0,
-                      show_ci: bool = True,
-                      ax: Optional[plt.Axes] = None,
-                      **kwargs):
+                  T: Union[List[float], np.ndarray],
+                  t: Union[int, List[int], None] = None,
+                  s: int = 0,
+                  show_ci: bool = True,
+                  ax: Optional[plt.Axes] = None,
+                    **kwargs):
         """
-        Plots Return Level curves (Log-X scale) with aesthetic styling.
-        
-        Flexibility Features:
-        - Pass 'color' or 'c' in kwargs to force a single color.
-        - Pass 'cmap' (e.g., plt.cm.coolwarm) to use a custom gradient.
-        - Returns the 'ax' object so you can add reference lines/curves afterwards.
+        Parameters
+        ----------
+        T : list or np.ndarray
+            Return periods.
+        t : int, list of int, or None
+            Time indices. If None, uses [0, mid, last].
+        s : int
+            Site index (single site only).
+        show_ci : bool
+            Whether to show confidence bands returned by ReturnLevel.compute().
+        ax : plt.Axes, optional
+            Axis to plot on. If None, a new figure/axis is created.
+        **kwargs :
+            Passed to ax.plot() (e.g. linestyle, alpha, etc.).
+            Optional:
+                - color / c : force a single color for all lines
+                - cmap       : colormap for multiple lines
         """
-        
+
         # --- 1. SAFETY CHECK FOR S ---
-        # Prevent "spaghetti plots" by enforcing scalar site index
         if np.size(s) > 1:
             raise ValueError(
-                f"Plotting multiple sites simultaneously is ambiguous. "
-                f"Please provide a single integer for 's' (Space). "
-                f"To compare sites, call .plot.return_levels() multiple times on the same axis."
+                "Plotting multiple sites simultaneously is ambiguous. "
+                "Please provide a single integer for 's' (Space). "
+                "To compare sites, call .plot.return_levels() multiple times on the same axis."
             )
 
-        # 2. Input Normalization
+        # 2. Time indices
         if t is None:
             n_obs = self.fit.n_obs
             t_indices = sorted(list(set([0, n_obs // 2, n_obs - 1])))
         else:
             t_indices = np.atleast_1d(t).tolist()
 
-        T = np.array(T, dtype=float)
+        T = np.asarray(T, dtype=float)
 
         # 3. Check for Singularity (Polite Warning)
         if np.any(T <= 1.0):
@@ -61,103 +71,96 @@ class GEVPlotter:
             figsize = kwargs.pop('figsize', (10, 6))
             fig, ax = plt.subplots(figsize=figsize)
 
-        # --- 5. COLOR LOGIC (The flexible hierarchy) ---
-        
-        # A. Did user force a single color?
+        # --- 5. COLOR LOGIC ---
         user_color = kwargs.get('color', kwargs.get('c', None))
-        
-        # B. Did user provide a custom gradient map?
-        # We MUST .pop() this because ax.plot() crashes if it sees 'cmap'
         user_cmap = kwargs.pop('cmap', None)
 
-        # C. Decide on the color list
-        if user_color:
-            # Priority 1: Uniform color for all lines
+        if user_color is not None:
             final_colors = [user_color] * len(t_indices)
-        elif user_cmap:
-            # Priority 2: Custom User Gradient
-            # Sample N colors from the provided colormap
+        elif user_cmap is not None:
             final_colors = user_cmap(np.linspace(0, 1, len(t_indices)))
         else:
-            # Priority 3: Default "Magma" Gradient
-            # We slice 0.2-0.85 to avoid invisible blacks or faint yellows
             if len(t_indices) > 1:
                 final_colors = plt.cm.magma(np.linspace(0.2, 0.85, len(t_indices)))
             else:
-                final_colors = ['#1f77b4'] # Standard Blue for single line
+                final_colors = ['#1f77b4']
 
-        # Clean kwargs: ensure we don't pass color twice
+        # Clean kwargs for ax.plot
         plot_kwargs = {k: v for k, v in kwargs.items() if k not in ['color', 'c', 'label']}
 
-        # 6. Main Loop
+        # --- 6. SMART USE OF ReturnLevel.compute ---
+        # Build one ReturnLevel over all requested times and this single site
+        rl_obj = self.fit.return_level(t=t_indices, s=s)
+
+        # compute now returns: zp, se, ci
+        # shapes: (N_t, N_s, N_periods) and (N_t, N_s, N_periods, 2)
+        levels, ses, ci = rl_obj.compute(T)
+
+        # Since s is scalar, N_s == 1; we’ll always index [:, 0, :]
+        # Main plotting loop over time index axis
         for i, t_idx in enumerate(t_indices):
-            
-            # --- Factory Call ---
-            rl_obj = self.fit.return_level(t=t_idx, s=s)
-            levels, ses = rl_obj.compute(T)
-            
-            # Flatten 
-            y = levels.flatten()
-            y_se = ses.flatten()
-            
-            # Masking (Hide T<=1 or NaNs)
+            y = levels[i, 0, :]       # (N_periods,)
+            y_se = ses[i, 0, :]       # (N_periods,)
+            y_ci = ci[i, 0, :, :]     # (N_periods, 2)
+
+            # Mask: finite only (will naturally drop bad T or NaNs)
             mask = np.isfinite(y) & np.isfinite(y_se)
-            if not np.any(mask): continue
+            if not np.any(mask):
+                continue
 
             T_valid = T[mask]
             y_valid = y[mask]
             se_valid = y_se[mask]
+            ci_valid = y_ci[mask, :]  # (N_valid, 2)
 
-            # Labeling
+            lower_valid = ci_valid[:, 0]
+            upper_valid = ci_valid[:, 1]
+
+            # Label for legend
             label = f"t={t_idx}"
-            if s > 0: label += f", s={s}"
+            if s > 0:
+                label += f", s={s}"
 
-            # Pick color for this specific line
             color_to_use = final_colors[i]
 
-            # PLOT LINE
-            # We pass **plot_kwargs here! (e.g. linestyle='--', alpha=0.5)
-            line, = ax.plot(T_valid, y_valid, 
-                            label=label, 
-                            color=color_to_use, 
-                            lw=2.5,
-                            **plot_kwargs) 
-            
-            # PLOT CI
+            # Plot line
+            line, = ax.plot(
+                T_valid,
+                y_valid,
+                label=label,
+                color=color_to_use,
+                lw=2.5,
+                **plot_kwargs,
+            )
+
+            # Plot CI band from compute()
             if show_ci:
-                lower = y_valid - 1.96 * se_valid
-                upper = y_valid + 1.96 * se_valid
-                
                 ax.fill_between(
-                    T_valid, lower, upper, 
-                    color=line.get_color(), # Matches line color exactly
-                    alpha=0.15, 
-                    lw=0
+                    T_valid,
+                    lower_valid,
+                    upper_valid,
+                    color=line.get_color(),
+                    alpha=0.15,
+                    lw=0,
                 )
 
-        # 7. AESTHETICS (The "Pretty" Touches)
-        
-        # Ticks: 10, 100 instead of 10^1, 10^2
+        # 7. AESTHETICS
         ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
         ax.xaxis.set_minor_formatter(ticker.ScalarFormatter())
-        
-        # Remove Spines (Modern look)
+
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-        
-        # Grid
+
         ax.grid(True, which="major", ls="-", alpha=0.2, color='k')
         ax.grid(True, which="minor", ls=":", alpha=0.1, color='k')
 
-        # Labels
         ax.set_title(f"Return Level Plot (Site {s})", fontsize=12, pad=15)
         ax.set_xlabel("Return Period (Years)", fontsize=10)
         ax.set_ylabel("Return Level", fontsize=10)
-        
-        # Legend (only if we drew something)
+
         if len(t_indices) > 0:
             ax.legend(frameon=False, loc='best')
-            
+
         return ax
     
     

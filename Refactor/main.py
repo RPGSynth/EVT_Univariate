@@ -122,8 +122,9 @@ def main():
     # --- Shape ---
     print(f"Shape Intercept(True 0.15): {est[offset+d_s]:.4f}")
     
-    z,se = result.return_level(t=[1,10],s=0).compute([10,100])
-    print(z.shape)
+    rl,se,ci= result.return_level(t=[1,10],s=0).compute([10,100])
+    print(rl[1,0,1])
+    print(ci[1,0,1,:])
     
     ax = result.plot.return_levels(
         T=[10,50,100,200,500,1000,5000], 
