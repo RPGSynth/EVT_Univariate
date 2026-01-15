@@ -145,6 +145,7 @@ class GEVPlotter:
                 )
 
         # 7. AESTHETICS
+        ax.set_xscale("log")
         ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
         ax.xaxis.set_minor_formatter(ticker.ScalarFormatter())
 

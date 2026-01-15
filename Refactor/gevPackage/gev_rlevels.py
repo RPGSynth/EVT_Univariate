@@ -20,8 +20,7 @@ class ReturnLevel:
         self,
         fit: "GEVFit",
         t: Union[int, np.ndarray, list] = 0,
-        s: Union[int, np.ndarray, list] = 0,
-        confidence: float = 0.95,
+        s: Union[int, np.ndarray, list] = 0
     ):
         """
         Parameters
@@ -39,7 +38,6 @@ class ReturnLevel:
         self.reparam_T = getattr(fit, "reparam_T", None)
         self.params_j = jnp.array(self.fit.params, dtype=float)
         self.cov_j = jnp.array(self.fit.cov_matrix, dtype=float)
-        self.confidence = float(confidence)
 
         # --- 1. Smart indexing over t and s ---
         t_idx = np.atleast_1d(t)
@@ -58,7 +56,7 @@ class ReturnLevel:
         self.exog_scale = jnp.array(data.exog_scale[flat_t, flat_s, :], dtype=float)
         self.exog_shape = jnp.array(data.exog_shape[flat_t, flat_s, :], dtype=float)
 
-    def compute(self, T):
+    def compute(self, T, confidence=0.95):
         """
         Compute return levels, standard errors, and confidence intervals.
 
@@ -103,7 +101,7 @@ class ReturnLevel:
         se = np.asarray(se_flat).reshape(final_shape)
 
         # 4. Symmetric normal-approximation CI
-        z = _z_from_confidence(self.confidence)
+        z = _z_from_confidence(confidence)
         lower = zp - z * se
         upper = zp + z * se
 

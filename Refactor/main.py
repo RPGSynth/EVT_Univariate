@@ -46,7 +46,7 @@ def generate_synthetic_data(n_obs=20, n_samples=10):
     sigma_true = linker.np_transform_scale(lin_scale)
     
     # Shape: Xi = 0.15
-    xi_true = np.full((n_obs, n_samples), 0.1)
+    xi_true = np.full((n_obs, n_samples), -0.2)
     
     # --- 3. Simulate Endog Data ---
     endog = genextreme.rvs(c=-xi_true, loc=mu_true, scale=sigma_true, size=(n_obs, n_samples))
@@ -94,7 +94,7 @@ def main():
     
     # 4. Summary
     print(result)
-    
+    print(result.ci())
     # 5. Check Values against Truth
     print("\n--- Ground Truth Check ---")
     est = result.params

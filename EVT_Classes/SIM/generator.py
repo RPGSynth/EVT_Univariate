@@ -7,13 +7,8 @@ via keywords while defaulting to *linear time* and *linear space*.
 
 Covariate regimes
 -----------------
-Temporal (``temporal=``)
-  - ``"linear"`` *(default)* — linearly increasing covariate (z-scored).
-  - ``"late_exp"`` — late-onset exponential (z-scored).
-
-Spatial (``spatial=``)
-  - ``"linear"`` *(default)* — planar field ``s' = a x + b y`` (z-scored).
-  - ``"gstools"`` — gstools Matern field; optional multi-scale composition (z-scored).
+Temporal: fixed to a linear covariate on [0, 1].
+Spatial: either a linear plane on [0, 1] or a gstools Matern field on [0, 1].
 
 Both covariates enter linearly into the GEV location and log-scale. Sampling uses
 ``scipy.stats.genextreme`` with the SciPy parameterization ``c = -xi``.
@@ -33,7 +28,7 @@ Requires: numpy, scipy, gstools, matplotlib
 from __future__ import annotations
 
 from typing import Dict, Tuple, TypedDict
-
+import gstools as gs
 import numpy as np
 from scipy.stats import genextreme
 import matplotlib.pyplot as plt
@@ -51,22 +46,16 @@ __all__ = [
 def linear_time_covariate(n_time: int, *, slope: float, intercept: float, standardize: bool = True) -> np.ndarray:
     t = slope * np.arange(n_time) + intercept
     if standardize:
-        t = (t - t.mean()) / (t.std() + 1e-12)
+        t_min, t_max = t.min(), t.max()
+        t = (t - t_min) / (t_max - t_min + 1e-12)
     return t
-
-def late_exp_curve(n_time: int, *, onset: float, p: float, alpha: float) -> np.ndarray:
-    # Simple late-exponential-like curve on [0,1] with onset ∈ [0,1)
-    u = np.linspace(0.0, 1.0, n_time)
-    z = np.where(u < onset, 0.0, ((u - onset) / max(1e-12, 1 - onset)) ** p)
-    z = (np.exp(alpha * z) - 1.0) / max(1e-12, alpha)
-    z = (z - z.mean()) / (z.std() + 1e-12)
-    return z
 
 def linear_space_covariate(x: np.ndarray, y: np.ndarray, *, a: float, b: float, standardize: bool = True) -> np.ndarray:
     X, Y = np.meshgrid(x, y, indexing="xy")
     s = a * X + b * Y
     if standardize:
-        s = (s - s.mean()) / (s.std() + 1e-12)
+        s_min, s_max = s.min(), s.max()
+        s = (s - s_min) / (s_max - s_min + 1e-12)
     return s
 
 class SpaceTimeMeta(TypedDict):
@@ -87,15 +76,9 @@ def generate_gev_dataset_linear(
     Lx: float = 100.0,
     Ly: float = 100.0,
     *,
-    # temporal regime: "linear" or "late_exp"
-    temporal: str = "linear",
     # linear time params
     t_slope: float = 1.0,
     t_intercept: float = 0.0,
-    # late-exp time params
-    t_onset: float = 0.0,
-    t_p: float = 3.0,
-    t_alpha: float = 0.25,
     # linear space params
     a: float = 1.0,
     b: float = 1.0,
@@ -109,13 +92,16 @@ def generate_gev_dataset_linear(
     beta_xi0: float = 0.1,
     beta_xi_s: float = 0.0,
     beta_xi_t: float = 0.0,
+    # optional xi noise
+    xi_noise: bool = False,
+    xi_noise_amp: float = 0.1,
     # RNG
     seed: int = 2025,
 ) -> Tuple[np.ndarray, SpaceTimeMeta]:
     """
     Simulate a space–time GEV dataset (linear covariates in space and time only).
 
-    Temporal covariate can be 'linear' or 'late_exp'; spatial covariate is a linear plane.
+    Temporal covariate is linear on [0, 1]; spatial covariate is a linear plane on [0, 1].
     Parameters for mu, log(sigma), and xi are linear in those covariates.
 
     By default, xi has no covariate effect and equals 0.1 everywhere.
@@ -127,18 +113,13 @@ def generate_gev_dataset_linear(
     """
     if n_lat < 1 or n_lon < 1 or n_time < 1:
         raise ValueError("n_lat, n_lon, n_time must be >= 1")
-    if temporal not in {"linear", "late_exp"}:
-        raise ValueError("temporal must be 'linear' or 'late_exp'")
 
     rng = np.random.default_rng(seed)
     x = np.linspace(0.0, Lx, n_lon)
     y = np.linspace(0.0, Ly, n_lat)
 
-    # temporal covariate
-    if temporal == "linear":
-        t_curve = linear_time_covariate(n_time, slope=t_slope, intercept=t_intercept, standardize=True)
-    else:
-        t_curve = late_exp_curve(n_time, onset=t_onset, p=t_p, alpha=t_alpha)
+    # temporal covariate (always linear, scaled to [0, 1])
+    t_curve = linear_time_covariate(n_time, slope=t_slope, intercept=t_intercept, standardize=True)
 
     # spatial covariate (always linear)
     s_field = linear_space_covariate(x, y, a=a, b=b, standardize=True)
@@ -152,6 +133,10 @@ def generate_gev_dataset_linear(
     log_sigma = beta_ls0 + beta_ls_s * s3 + beta_ls_t * t3  # varies only if you set nonzero betas
     sigma = np.exp(log_sigma)
     xi = beta_xi0 + beta_xi_s * s3 + beta_xi_t * t3        # default: constant 0.1
+
+    # optional additive noise on xi (±xi_noise_amp)
+    if xi_noise:
+        xi = xi + rng.choice([-xi_noise_amp, xi_noise_amp], size=xi.shape)
 
     # sampling: SciPy genextreme uses c = -xi
     data = np.empty((n_time, n_lat, n_lon))
@@ -169,13 +154,12 @@ def generate_gev_dataset_linear(
         "xi": xi,
         "params": {
             "Lx": Lx, "Ly": Ly,
-            "temporal": temporal,
             "t_slope": t_slope, "t_intercept": t_intercept,
-            "t_onset": t_onset, "t_p": t_p, "t_alpha": t_alpha,
             "a": a, "b": b,
             "beta_mu0": beta_mu0, "beta_mu_s": beta_mu_s, "beta_mu_t": beta_mu_t,
             "beta_ls0": beta_ls0, "beta_ls_s": beta_ls_s, "beta_ls_t": beta_ls_t,
             "beta_xi0": beta_xi0, "beta_xi_s": beta_xi_s, "beta_xi_t": beta_xi_t,
+            "xi_noise": xi_noise, "xi_noise_amp": xi_noise_amp,
             "seed": seed,
         },
     }
@@ -185,6 +169,110 @@ def generate_gev_dataset_linear(
 # Plotting
 # -----------------------------------------------------------------------------
 
+def generate_gev_dataset_blobs(
+    n_lat: int = 50,
+    n_lon: int = 50,
+    n_time: int = 100,
+    Lx: float = 100.0,
+    Ly: float = 100.0,
+    *,
+    # --- Temporal Params (Linear) ---
+    t_slope: float = 1.0,
+    t_intercept: float = 0.0,
+    
+    # --- Spatial Params (Blobs/Anisotropy) ---
+    # len_scale: [lat_scale, lon_scale] for anisotropy
+    blob_scale_x: float = 20.0, 
+    blob_scale_y: float = 8.0, 
+    blob_angle: float = np.pi / 4, 
+    blob_smoothness: float = 1.5, 
+    blob_variance: float = 1.0,
+
+    # --- Regression Params ---
+    beta_mu0: float = 10.0,
+    beta_mu_s: float = 2.0,   
+    beta_mu_t: float = 0.5,   
+    beta_ls0: float = 0.0,
+    beta_ls_s: float = 0.5,   
+    beta_ls_t: float = 0.0,
+    beta_xi0: float = 0.1,
+    beta_xi_s: float = 0.0,   
+    beta_xi_t: float = 0.0,
+    xi_noise: bool = False,
+    xi_noise_amp: float = 0.1,
+    
+    seed: int = 2025,
+) -> Tuple[np.ndarray, SpaceTimeMeta]:
+    """
+    Simulates a Space-Time GEV dataset using Gaussian Random Fields for space.
+    Corrected to fix gstools TypeError.
+    """
+    if n_lat < 1 or n_lon < 1 or n_time < 1:
+        raise ValueError("Dims must be >= 1")
+
+    # 1. Setup Grid
+    # We define axis vectors, not a meshgrid yet
+    x = np.linspace(0.0, Lx, n_lon)
+    y = np.linspace(0.0, Ly, n_lat)
+    
+    # 2. Generate Temporal Covariate (Linear)
+    t_curve = linear_time_covariate(n_time, slope=t_slope, intercept=t_intercept, standardize=True)
+
+    # 3. Generate Spatial Covariate (Anisotropic Random Field)
+    # Note: gstools uses [y_scale, x_scale] convention often, but we can align 
+    # it by passing axes explicitly.
+    model = gs.Matern(
+        dim=2, 
+        var=blob_variance, 
+        len_scale=[blob_scale_y, blob_scale_x], # [y, x] is standard for dim=2 in some versions, but check angle
+        angles=blob_angle, 
+        nu=blob_smoothness
+    )
+    
+    srf = gs.SRF(model, seed=seed)
+
+    s_field_raw = srf.structured([y, x]) 
+    
+    # Standardize
+    s_min, s_max = s_field_raw.min(), s_field_raw.max()
+    s_field = (s_field_raw - s_min) / (s_max - s_min + 1e-12)
+
+    # 4. Regression (Linear combination)
+    # Broadcast to (t, y, x)
+    s3 = s_field[None, :, :]      # (1, n_lat, n_lon)
+    t3 = t_curve[:, None, None]   # (n_time, 1, 1)
+
+    mu = beta_mu0 + beta_mu_s * s3 + beta_mu_t * t3
+    log_sigma = beta_ls0 + beta_ls_s * s3 + beta_ls_t * t3
+    sigma = np.exp(log_sigma)
+    xi = beta_xi0 + beta_xi_s * s3 + beta_xi_t * t3
+    if xi_noise:
+        xi = xi + rng.choice([-xi_noise_amp, xi_noise_amp], size=xi.shape)
+
+    # 5. Sampling
+    rng = np.random.default_rng(seed)
+    data = np.empty((n_time, n_lat, n_lon))
+    
+    for ti in range(n_time):
+        data[ti] = genextreme.rvs(c=-xi[ti], loc=mu[ti], scale=sigma[ti], random_state=rng)
+
+    # 6. Metadata
+    meta: SpaceTimeMeta = {
+        "x": x, "y": y, "t": np.arange(n_time),
+        "s_field": s_field,
+        "t_curve": t_curve,
+        "mu": mu, "sigma": sigma, "xi": xi,
+        "params": {
+            "type": "blob_anisotropic_gstools",
+            "blob_scale": [blob_scale_x, blob_scale_y],
+            "blob_angle": blob_angle,
+            "seed": seed,
+            "beta_xi0": beta_xi0, "beta_xi_s": beta_xi_s, "beta_xi_t": beta_xi_t,
+            "xi_noise": xi_noise, "xi_noise_amp": xi_noise_amp,
+        }
+    }
+    
+    return data, meta
 
 def plot_random_time_series(
     data: np.ndarray,

@@ -7,7 +7,7 @@ from .engines.jax_engine import nloglike_sum, compute_sandwich_matrices, linker
 from .gev_results import GEVFit
 
 class GEVModel:
-    def __init__(self, max_iter=1000,reparam_T=None):
+    def __init__(self, max_iter=1000,reparam_T=None,confidence=0.95):
         """
         Args:
             reparam_T (float, optional): If set (e.g., 100), the model replaces the 
@@ -15,6 +15,7 @@ class GEVModel:
         """
         self.max_iter = max_iter
         self.reparam_T = float(reparam_T) if reparam_T is not None else None
+        self.confidence = confidence
     
     def fit(self, endog, exog=None, weights=None) -> GEVFit:
         # 1. Parse Data
@@ -61,5 +62,6 @@ class GEVModel:
             nll_avg=float(res.state.value),   # JAX scalar -> Python float
             data=data,
             linker=linker,
-            reparam_T=self.reparam_T
+            reparam_T=self.reparam_T,
+            confidence=self.confidence
         )
