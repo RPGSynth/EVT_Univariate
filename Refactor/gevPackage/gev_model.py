@@ -34,8 +34,64 @@ class GEVModel:
             return nll_sum / W_total
             
         # 4. Optimize (JAX)
-        solver = jaxopt.LBFGS(fun=objective, maxiter=self.max_iter, tol=1e-12)
+        solver = jaxopt.LBFGS(fun=objective, maxiter=self.max_iter, tol=1e-6)
         res = solver.run(init_params)
+
+        # 4b. Fail fast on optimization issues instead of silently using bad fits.
+        state = res.state
+
+        def _scalar_or_none(x):
+            if x is None:
+                return None
+            arr = np.asarray(x)
+            if arr.size != 1:
+                return None
+            return float(arr.reshape(()))
+
+        params_np = np.asarray(res.params, dtype=float)
+        if not np.isfinite(params_np).all():
+            raise RuntimeError("LBFGS optimization produced non-finite parameters.")
+
+        nll_avg = _scalar_or_none(getattr(state, "value", None))
+        if nll_avg is None or not np.isfinite(nll_avg):
+            raise RuntimeError("LBFGS optimization produced a non-finite objective value.")
+
+        grad = getattr(state, "grad", None)
+        if grad is not None:
+            grad_np = np.asarray(grad, dtype=float)
+            if not np.isfinite(grad_np).all():
+                raise RuntimeError("LBFGS optimization produced non-finite gradients.")
+
+        failed = getattr(state, "failed", None)
+        if failed is not None:
+            failed_val = bool(np.asarray(failed).reshape(()))
+            if failed_val:
+                raise RuntimeError("LBFGS optimization reported failure.")
+
+        converged = getattr(state, "converged", None)
+        if converged is not None:
+            converged_val = bool(np.asarray(converged).reshape(()))
+            if not converged_val:
+                iter_num = _scalar_or_none(getattr(state, "iter_num", None))
+                error = _scalar_or_none(getattr(state, "error", None))
+                raise RuntimeError(
+                    f"LBFGS did not converge (iter_num={iter_num}, error={error})."
+                )
+        else:
+            iter_num = _scalar_or_none(getattr(state, "iter_num", None))
+            error = _scalar_or_none(getattr(state, "error", None))
+            tol = _scalar_or_none(getattr(solver, "tol", None))
+            if (
+                iter_num is not None
+                and iter_num >= float(self.max_iter)
+                and error is not None
+                and tol is not None
+                and error > tol
+            ):
+                raise RuntimeError(
+                    f"LBFGS likely stopped at max_iter without convergence "
+                    f"(iter_num={iter_num}, error={error}, tol={tol})."
+                )
         
         # 5. Sandwich Covariance (JAX)
         # H and B are JAX arrays here
@@ -59,7 +115,7 @@ class GEVModel:
         return GEVFit(
             params=np.array(res.params),       # JAX -> NumPy
             cov_matrix=np.array(cov_matrix_jax), # JAX -> NumPy
-            nll_avg=float(res.state.value),   # JAX scalar -> Python float
+            nll_avg=float(nll_avg),
             data=data,
             linker=linker,
             reparam_T=self.reparam_T,

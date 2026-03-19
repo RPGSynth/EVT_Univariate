@@ -27,7 +27,7 @@ Requires: numpy, scipy, gstools, matplotlib
 
 from __future__ import annotations
 
-from typing import Dict, Tuple, TypedDict
+from typing import Dict, Optional, Tuple, TypedDict
 import gstools as gs
 import numpy as np
 from scipy.stats import genextreme
@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 
 __all__ = [
     "generate_gev_dataset_linear",
+    "generate_gev_dataset_blobs",
     "plot_random_time_series",
     "plot_random_spatial_slice",
 ]
@@ -69,6 +70,30 @@ class SpaceTimeMeta(TypedDict):
     xi: np.ndarray
     params: dict
 
+
+def _resolve_rng_seeds(
+    *,
+    seed_field: int,
+    seed_sample: Optional[int],
+    seed: Optional[int],
+) -> Tuple[int, int]:
+    """
+    Resolve RNG seeds for field generation and sampling.
+
+    - ``seed_field`` controls the covariate/parameter field and should stay fixed across runs.
+    - ``seed_sample`` controls data realizations and should vary across runs.
+
+    Backward compatibility:
+    - if ``seed_sample`` is None and legacy ``seed`` is provided, use legacy ``seed``.
+    - if both are None, use ``seed_field + 1`` for sampling.
+    """
+    sf = int(seed_field)
+    if seed_sample is None:
+        ss = sf + 1 if seed is None else int(seed)
+    else:
+        ss = int(seed_sample)
+    return sf, ss
+
 def generate_gev_dataset_linear(
     n_lat: int = 50,
     n_lon: int = 50,
@@ -95,8 +120,13 @@ def generate_gev_dataset_linear(
     # optional xi noise
     xi_noise: bool = False,
     xi_noise_amp: float = 0.1,
-    # RNG
-    seed: int = 2025,
+    # RNG:
+    # - seed_field: fixed field-level randomness (xi_noise, if enabled)
+    # - seed_sample: realization randomness (time-series sampling)
+    # - seed: legacy alias for seed_sample
+    seed_field: int = 2025,
+    seed_sample: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, SpaceTimeMeta]:
     """
     Simulate a space–time GEV dataset (linear covariates in space and time only).
@@ -106,6 +136,13 @@ def generate_gev_dataset_linear(
 
     By default, xi has no covariate effect and equals 0.1 everywhere.
 
+    Seeding behavior
+    ----------------
+    ``seed_field`` is used for field-level randomness (currently xi noise if enabled),
+    while ``seed_sample`` is used for sampled realizations.
+    If ``seed_sample`` is omitted, it defaults to ``seed_field + 1`` unless legacy
+    ``seed`` is provided (legacy ``seed`` maps to ``seed_sample``).
+
     Returns
     -------
     data : (n_time, n_lat, n_lon)
@@ -114,7 +151,13 @@ def generate_gev_dataset_linear(
     if n_lat < 1 or n_lon < 1 or n_time < 1:
         raise ValueError("n_lat, n_lon, n_time must be >= 1")
 
-    rng = np.random.default_rng(seed)
+    seed_field, seed_sample = _resolve_rng_seeds(
+        seed_field=seed_field,
+        seed_sample=seed_sample,
+        seed=seed,
+    )
+    rng_field = np.random.default_rng(seed_field)
+    rng_sample = np.random.default_rng(seed_sample)
     x = np.linspace(0.0, Lx, n_lon)
     y = np.linspace(0.0, Ly, n_lat)
 
@@ -136,12 +179,12 @@ def generate_gev_dataset_linear(
 
     # optional additive noise on xi (±xi_noise_amp)
     if xi_noise:
-        xi = xi + rng.choice([-xi_noise_amp, xi_noise_amp], size=xi.shape)
+        xi = xi + rng_field.choice([-xi_noise_amp, xi_noise_amp], size=xi.shape)
 
     # sampling: SciPy genextreme uses c = -xi
     data = np.empty((n_time, n_lat, n_lon))
     for ti in range(n_time):
-        data[ti] = genextreme.rvs(c=-xi[ti], loc=mu[ti], scale=sigma[ti], random_state=rng)
+        data[ti] = genextreme.rvs(c=-xi[ti], loc=mu[ti], scale=sigma[ti], random_state=rng_sample)
 
     meta: SpaceTimeMeta = {
         "x": x,
@@ -160,7 +203,9 @@ def generate_gev_dataset_linear(
             "beta_ls0": beta_ls0, "beta_ls_s": beta_ls_s, "beta_ls_t": beta_ls_t,
             "beta_xi0": beta_xi0, "beta_xi_s": beta_xi_s, "beta_xi_t": beta_xi_t,
             "xi_noise": xi_noise, "xi_noise_amp": xi_noise_amp,
-            "seed": seed,
+            "seed_field": seed_field,
+            "seed_sample": seed_sample,
+            "seed_legacy": seed,
         },
     }
     return data, meta
@@ -201,14 +246,30 @@ def generate_gev_dataset_blobs(
     xi_noise: bool = False,
     xi_noise_amp: float = 0.1,
     
-    seed: int = 2025,
+    seed_field: int = 2025,
+    seed_sample: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, SpaceTimeMeta]:
     """
-    Simulates a Space-Time GEV dataset using Gaussian Random Fields for space.
-    Corrected to fix gstools TypeError.
+    Simulates a space-time GEV dataset using a Gaussian random field for space.
+
+    Seeding behavior
+    ----------------
+    ``seed_field`` controls the spatial covariate field (and xi noise if enabled),
+    while ``seed_sample`` controls sampled realizations.
+    If ``seed_sample`` is omitted, it defaults to ``seed_field + 1`` unless legacy
+    ``seed`` is provided (legacy ``seed`` maps to ``seed_sample``).
     """
     if n_lat < 1 or n_lon < 1 or n_time < 1:
         raise ValueError("Dims must be >= 1")
+
+    seed_field, seed_sample = _resolve_rng_seeds(
+        seed_field=seed_field,
+        seed_sample=seed_sample,
+        seed=seed,
+    )
+    rng_field = np.random.default_rng(seed_field)
+    rng_sample = np.random.default_rng(seed_sample)
 
     # 1. Setup Grid
     # We define axis vectors, not a meshgrid yet
@@ -229,7 +290,7 @@ def generate_gev_dataset_blobs(
         nu=blob_smoothness
     )
     
-    srf = gs.SRF(model, seed=seed)
+    srf = gs.SRF(model, seed=seed_field)
 
     s_field_raw = srf.structured([y, x]) 
     
@@ -247,14 +308,13 @@ def generate_gev_dataset_blobs(
     sigma = np.exp(log_sigma)
     xi = beta_xi0 + beta_xi_s * s3 + beta_xi_t * t3
     if xi_noise:
-        xi = xi + rng.choice([-xi_noise_amp, xi_noise_amp], size=xi.shape)
+        xi = xi + rng_field.choice([-xi_noise_amp, xi_noise_amp], size=xi.shape)
 
     # 5. Sampling
-    rng = np.random.default_rng(seed)
     data = np.empty((n_time, n_lat, n_lon))
     
     for ti in range(n_time):
-        data[ti] = genextreme.rvs(c=-xi[ti], loc=mu[ti], scale=sigma[ti], random_state=rng)
+        data[ti] = genextreme.rvs(c=-xi[ti], loc=mu[ti], scale=sigma[ti], random_state=rng_sample)
 
     # 6. Metadata
     meta: SpaceTimeMeta = {
@@ -266,7 +326,9 @@ def generate_gev_dataset_blobs(
             "type": "blob_anisotropic_gstools",
             "blob_scale": [blob_scale_x, blob_scale_y],
             "blob_angle": blob_angle,
-            "seed": seed,
+            "seed_field": seed_field,
+            "seed_sample": seed_sample,
+            "seed_legacy": seed,
             "beta_xi0": beta_xi0, "beta_xi_s": beta_xi_s, "beta_xi_t": beta_xi_t,
             "xi_noise": xi_noise, "xi_noise_amp": xi_noise_amp,
         }
@@ -363,3 +425,4 @@ if __name__ == "__main__":
     #     spatial="gstools", temporal="late_exp",
     #     t_onset=0.2, t_p=3.0, t_alpha=0.3,
     # )
+
