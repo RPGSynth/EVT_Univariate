@@ -99,7 +99,8 @@ def nloglike_sum(params, endog, exog_loc, exog_scale, exog_shape, weights, dims,
 @partial(jax.jit, static_argnames=('dims', 'reparam_T'))
 def compute_sandwich_matrices(params, endog, exog_loc, exog_scale, exog_shape, weights, dims,reparam_T=None):
     """
-    Computes the matrices for the Godambe Covariance of the AVERAGE Likelihood.
+    Computes the matrices for the Godambe covariance of the average weighted
+    likelihood, assuming independence at the individual (obs, sample) cell level.
     L_avg = (1/W) * Sum(w_i * l_i)
     """
     W_total = jnp.sum(weights)
@@ -111,29 +112,55 @@ def compute_sandwich_matrices(params, endog, exog_loc, exog_scale, exog_shape, w
     # 2. Hessian of Average NLL (The Bread)
     H = jax.hessian(objective_avg)(params)
     
-    # 3. Gradients of individual terms (The Meat)
-    # We need the gradient of (w_i * l_i / W_total) for each observation
-    def row_term_func(params, y_row, exog_loc_row, exog_scale_row, exog_shape_row, w_row):
-        # Calculate NLL for this row, weight it, and scale by 1/W_total
+    # 3. Gradients of individual independent cells (The Meat)
+    # For independent (obs, sample) cells:
+    # J = Sum_{i,s} psi_{i,s} psi_{i,s}^T, where
+    # psi_{i,s} = grad[(w_{i,s} / W_total) * l_{i,s}].
+    def cell_term_func(params, y_cell, exog_loc_cell, exog_scale_cell, exog_shape_cell, w_cell):
         nll_val = nloglike_sum(
             params,
-            y_row[None, :], 
-            exog_loc_row[None, ...],
-            exog_scale_row[None, ...],
-            exog_shape_row[None, ...],
-            w_row[None, :], 
+            y_cell[None, None],
+            exog_loc_cell[None, None, :],
+            exog_scale_cell[None, None, :],
+            exog_shape_cell[None, None, :],
+            w_cell[None, None],
             dims,
             reparam_T
         )
         return nll_val / W_total
 
-    # Vectorize gradient calculation over N_obs
-    grads = jax.vmap(jax.grad(row_term_func), in_axes=(None, 0, 0, 0, 0, 0))(
-        params, endog, exog_loc, exog_scale, exog_shape, weights
+    endog_flat = endog.reshape(-1)
+    exog_loc_flat = exog_loc.reshape(-1, exog_loc.shape[-1])
+    exog_scale_flat = exog_scale.reshape(-1, exog_scale.shape[-1])
+    exog_shape_flat = exog_shape.reshape(-1, exog_shape.shape[-1])
+    weights_flat = weights.reshape(-1)
+
+    # Vectorize gradient calculation over all independent cells
+    grads = jax.vmap(jax.grad(cell_term_func), in_axes=(None, 0, 0, 0, 0, 0))(
+        params, endog_flat, exog_loc_flat, exog_scale_flat, exog_shape_flat, weights_flat
     )
     
-    # B = Sum of outer products of these scaled gradients
+    # B = Sum of outer products of cellwise scaled gradients
     B = jnp.einsum('ni,nj->ij', grads, grads)
+
+    # Old row-cluster correction kept for reference:
+    # def row_term_func(params, y_row, exog_loc_row, exog_scale_row, exog_shape_row, w_row):
+    #     nll_val = nloglike_sum(
+    #         params,
+    #         y_row[None, :],
+    #         exog_loc_row[None, ...],
+    #         exog_scale_row[None, ...],
+    #         exog_shape_row[None, ...],
+    #         w_row[None, :],
+    #         dims,
+    #         reparam_T
+    #     )
+    #     return nll_val / W_total
+    #
+    # grads = jax.vmap(jax.grad(row_term_func), in_axes=(None, 0, 0, 0, 0, 0))(
+    #     params, endog, exog_loc, exog_scale, exog_shape, weights
+    # )
+    # B = jnp.einsum('ni,nj->ij', grads, grads)
     
     return H, B
 
@@ -156,7 +183,6 @@ def return_level_atomic(params, exog_loc, exog_scale, exog_shape, T, dims, repar
     mu = jnp.squeeze(mu)
     sigma = jnp.squeeze(sigma)
     xi = jnp.squeeze(xi)
-    # --- FIX END ---
     
     y = -jnp.log(1.0 - 1.0/T)
     
