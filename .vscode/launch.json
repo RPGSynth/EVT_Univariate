@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Current File (phd)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "python": "C:\\Users\\robert\\miniconda3\\envs\\phd\\python.exe"
+    }
+  ]
+}

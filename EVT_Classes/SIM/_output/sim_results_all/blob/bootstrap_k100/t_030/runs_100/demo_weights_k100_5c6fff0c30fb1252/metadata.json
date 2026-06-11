@@ -1,0 +1,25 @@
+{
+  "artifact_path": "C:\\github\\EVT_Univariate\\EVT_Univariate\\EVT_Classes\\SIM\\_cache\\weight_artifacts\\demo_weights_k100_5c6fff0c30fb1252.pt",
+  "artifact_type": "bootstrap",
+  "data_shape": [
+    100,
+    10,
+    10
+  ],
+  "force_rerun": false,
+  "generator": "blob",
+  "grid_shape": [
+    10,
+    10
+  ],
+  "n_bootstrap": 100,
+  "raw_dir": "C:\\github\\EVT_Univariate\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\sim_results_all\\blob\\bootstrap_k100\\t_030\\runs_100\\demo_weights_k100_5c6fff0c30fb1252\\raw",
+  "result_dir": "C:\\github\\EVT_Univariate\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\sim_results_all\\blob\\bootstrap_k100\\t_030\\runs_100\\demo_weights_k100_5c6fff0c30fb1252",
+  "return_periods": [
+    10,
+    100
+  ],
+  "sim_n_runs": 100,
+  "t_idx": 30,
+  "tables_dir": "C:\\github\\EVT_Univariate\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\sim_results_all\\blob\\bootstrap_k100\\t_030\\runs_100\\demo_weights_k100_5c6fff0c30fb1252\\tables"
+}

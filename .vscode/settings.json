@@ -1,0 +1,10 @@
+{
+  "python.defaultInterpreterPath": "C:\\Users\\robert\\miniconda3\\envs\\phd\\python.exe",
+  "python.pythonPath": "C:\\Users\\robert\\miniconda3\\envs\\phd\\python.exe",
+  "python.condaPath": "C:\\Users\\robert\\miniconda3\\Scripts\\conda.exe",
+  "python.terminal.activateEnvironment": true,
+  "code-runner.runInTerminal": true,
+  "code-runner.executorMap": {
+    "python": "C:\\Users\\robert\\miniconda3\\envs\\phd\\python.exe -u"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "artifact_path": "C:\\github\\EVT_Univariate\\EVT_Univariate\\EVT_Classes\\SIM\\_cache\\weight_artifacts\\demo_weights_k100_5c6fff0c30fb1252.pt",
+  "generator": "blob",
+  "local_selector_args": {
+    "include_center": true,
+    "max_points": 30,
+    "mode": "circle",
+    "radius": null
+  },
+  "local_selector_points": 30,
+  "n_bootstrap": 100,
+  "ref_i": 2,
+  "ref_j": 1,
+  "report_names": [
+    "pointwise",
+    "weighted",
+    "local",
+    "full"
+  ],
+  "sim_n_runs": 100,
+  "t_ref": 30,
+  "weight_export_dir": "C:\\github\\EVT_Univariate\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\weight_maps\\t_030",
+  "weighted_ess": 30.344605180488077
+}

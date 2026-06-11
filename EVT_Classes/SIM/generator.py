@@ -28,10 +28,8 @@ Requires: numpy, scipy, gstools, matplotlib
 from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, TypedDict
-import gstools as gs
 import numpy as np
 from scipy.stats import genextreme
-import matplotlib.pyplot as plt
 
 __all__ = [
     "generate_gev_dataset_linear",
@@ -262,6 +260,7 @@ def generate_gev_dataset_blobs(
     """
     if n_lat < 1 or n_lon < 1 or n_time < 1:
         raise ValueError("Dims must be >= 1")
+    import gstools as gs
 
     seed_field, seed_sample = _resolve_rng_seeds(
         seed_field=seed_field,
@@ -345,6 +344,8 @@ def plot_random_time_series(
 
     ``meta`` improves titles and axis labels when provided.
     """
+    import matplotlib.pyplot as plt
+
     rng = np.random.default_rng(seed)
     n_time, n_lat, n_lon = data.shape
     i = int(rng.integers(0, n_lat))
@@ -373,6 +374,8 @@ def plot_random_spatial_slice(
 
     ``meta`` improves titles and axis labels when provided.
     """
+    import matplotlib.pyplot as plt
+
     rng = np.random.default_rng(seed)
     n_time, _, _ = data.shape
     k = int(rng.integers(0, n_time))
