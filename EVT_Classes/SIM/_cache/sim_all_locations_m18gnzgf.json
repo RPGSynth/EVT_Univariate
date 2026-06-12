@@ -1,0 +1,34 @@
+{
+  "locations": [
+    {
+      "i": 2,
+      "j": 9,
+      "location_index": 29,
+      "output_path": "C:\\github\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\sim_results_all\\blob\\bootstrap_k100\\t_030\\runs_100\\demo_weights_k100_5c6fff0c30fb1252\\raw\\loc_029_i02_j09.json"
+    },
+    {
+      "i": 3,
+      "j": 0,
+      "location_index": 30,
+      "output_path": "C:\\github\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\sim_results_all\\blob\\bootstrap_k100\\t_030\\runs_100\\demo_weights_k100_5c6fff0c30fb1252\\raw\\loc_030_i03_j00.json"
+    },
+    {
+      "i": 3,
+      "j": 1,
+      "location_index": 31,
+      "output_path": "C:\\github\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\sim_results_all\\blob\\bootstrap_k100\\t_030\\runs_100\\demo_weights_k100_5c6fff0c30fb1252\\raw\\loc_031_i03_j01.json"
+    },
+    {
+      "i": 3,
+      "j": 2,
+      "location_index": 32,
+      "output_path": "C:\\github\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\sim_results_all\\blob\\bootstrap_k100\\t_030\\runs_100\\demo_weights_k100_5c6fff0c30fb1252\\raw\\loc_032_i03_j02.json"
+    },
+    {
+      "i": 3,
+      "j": 3,
+      "location_index": 33,
+      "output_path": "C:\\github\\EVT_Univariate\\EVT_Classes\\SIM\\_output\\sim_results_all\\blob\\bootstrap_k100\\t_030\\runs_100\\demo_weights_k100_5c6fff0c30fb1252\\raw\\loc_033_i03_j03.json"
+    }
+  ]
+}

@@ -6,5 +6,7 @@
   "code-runner.runInTerminal": true,
   "code-runner.executorMap": {
     "python": "C:\\Users\\robert\\miniconda3\\envs\\phd\\python.exe -u"
-  }
+  },
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

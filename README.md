@@ -9,15 +9,15 @@ Every folder is a small lab: some hold production-ready GEV code, others are san
 
 | Area | What it is | Key entry points |
 | --- | --- | --- |
-| **EVT_Classes/** | Legacy/statistical workflows plus neural-kernel experiments. | `GEV.py`, `utils.py`, `SIM/` simulator + notebook, `NN/` experiments. |
-| **Refactor/** | Modern GEV API powered by JAX/JAXopt. | `gevPackage/` modules; demo in `Refactor/main.py`. |
+| **EVT_Classes/** | Legacy statistical workflows plus the active SIM and NN code. | `deprecated/GEV.py`, `utils.py`, `SIM/` simulator + notebook, `NN/` neural-kernel core. |
+| **GEVFit/** | Modern GEV API powered by JAX/JAXopt. | `gevPackage/` modules; demo in `GEVFit/main.py`. |
 | **Exploration/** | Work-plan notes for the broader project. | `Exploration/README.md`. |
 | **Import/** | Download helpers for climate datasets (EOBS, CMIP-S). | `import_EOBS.py`, `import_CMISP.py`, bash `sh/` script. |
-| **outputs** | Example animations/plots from notebooks. | `EVT_Classes/SIM/*.gif`, `output.png`. |
+| **outputs** | Example generated plots and simulation artifacts. | `EVT_Classes/SIM/simulation_output/*`, `output.png`. |
 
 ---
 
-## 🚀 Quickstart (Refactored GEV API)
+## 🚀 Quickstart (GEVFit API)
 
 1. **Environment**
    ```bash

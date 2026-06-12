@@ -1,0 +1,5 @@
+location_index,location,i,j,x,y,weighted_ess,local_selector_points,pointwise_success_rate,weighted_success_rate,local_success_rate,full_success_rate,raw_report_path
+0,"(0,0)",0,0,0.0,0.0,13.549615162689415,14,0.99,1.0,1.0,1.0,C:\github\EVT_Univariate\EVT_Classes\SIM\_output\sim_results_all\blob\bootstrap_k001\t_030\runs_100\demo_weights_k001_9d1f86fa96ade42e\raw\loc_000_i00_j00.json
+1,"(0,1)",0,1,11.11111111111111,0.0,24.446049140020918,24,0.99,1.0,1.0,1.0,C:\github\EVT_Univariate\EVT_Classes\SIM\_output\sim_results_all\blob\bootstrap_k001\t_030\runs_100\demo_weights_k001_9d1f86fa96ade42e\raw\loc_001_i00_j01.json
+2,"(0,2)",0,2,22.22222222222222,0.0,26.032753910185733,26,0.97,1.0,1.0,1.0,C:\github\EVT_Univariate\EVT_Classes\SIM\_output\sim_results_all\blob\bootstrap_k001\t_030\runs_100\demo_weights_k001_9d1f86fa96ade42e\raw\loc_002_i00_j02.json
+3,"(0,3)",0,3,33.33333333333333,0.0,6.00961338974704,6,0.98,1.0,1.0,1.0,C:\github\EVT_Univariate\EVT_Classes\SIM\_output\sim_results_all\blob\bootstrap_k001\t_030\runs_100\demo_weights_k001_9d1f86fa96ade42e\raw\loc_003_i00_j03.json
